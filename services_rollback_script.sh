@@ -4,8 +4,8 @@
 # Purpose: Rollback hardening changes to original state
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DB_PATH="$SCRIPT_DIR/hardening.db"
-BACKUP_DIR="$SCRIPT_DIR/backups/services"
+DB_PATH="$SCRIPT_DIR/../hardening.db"
+BACKUP_DIR="$SCRIPT_DIR/../backups/services"
 MODULE_NAME="Services"
 
 # Colors for output
