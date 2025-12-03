@@ -27,29 +27,14 @@ FAILED_CHECKS=0
 FIXED_CHECKS=0
 MANUAL_CHECKS=0
 
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
+log_pass()  { echo -e "${GREEN}[PASS]${NC} $1"; }
+log_manual() { echo -e "${BLUE}[FIXED]${NC} $1"; }
+
 # Track if fstab was modified
 FSTAB_MODIFIED=false
-
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[FAIL]${NC} $1"
-}
-
-log_pass() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-}
-
-log_manual() {
-    echo -e "${BLUE}[MANUAL]${NC} $1"
-}
-
 # Initialize Database
 init_database() {
     python3 -c "
@@ -102,7 +87,6 @@ except sqlite3.Error as e:
 "
 }
 
-# Print formatted output
 print_check_result() {
     local policy_id="$1"
     local policy_name="$2"
@@ -110,13 +94,22 @@ print_check_result() {
     local current="$4"
     local status="$5"
     
+    # Apply color
+    local status_colored="$status"
+    case "$status" in
+        PASS) status_colored="${GREEN}$status${NC}" ;;
+        FAIL) status_colored="${RED}$status${NC}" ;;
+        FIXED) status_colored="${BLUE}$status${NC}" ;;
+        WARN) status_colored="${YELLOW}$status${NC}" ;;
+    esac
+    
     echo "=============================================="
     echo "Module Name    : $MODULE_NAME"
     echo "Policy ID      : $policy_id"
     echo "Policy Name    : $policy_name"
     echo "Expected Value : $expected"
     echo "Current Value  : $current"
-    echo "Status         : $status"
+    echo -e "Status         : $status_colored"
     echo "=============================================="
 }
 
