@@ -352,17 +352,31 @@ check_package() {
             local backup_file="$BACKUP_DIR/${package}_backup.txt"
             dpkg -l "$package" 2>/dev/null > "$backup_file"
             
+            log_info "Removing package: $package"
             apt remove -y "$package" >/dev/null 2>&1
             
+            # Verify removal
+            if dpkg -l 2>/dev/null | grep -q "^ii.*$package"; then
+                log_error "Failed to remove $package"
+                local current_value="installed"
+                local status="FAIL"
+                ((FAILED_CHECKS++))
+            else
+                log_fixed "$policy_name"
+                local current_value="not installed"
+                local status="PASS"
+                ((FIXED_CHECKS++))
+            fi
+            
+            local expected="not installed"
+            save_fix_result "$policy_id" "$policy_name" "$expected" "$original_value" "$current_value" "$status"
+        else
+            log_pass "$package already not installed"
+            # Still save to fix_history to track that we checked it
             local current_value="not installed"
             local expected="not installed"
             local status="PASS"
-            
-            log_fixed "$policy_name"
             save_fix_result "$policy_id" "$policy_name" "$expected" "$original_value" "$current_value" "$status"
-            ((FIXED_CHECKS++))
-        else
-            log_pass "$package already not installed"
         fi
         
     elif [ "$MODE" = "rollback" ]; then
