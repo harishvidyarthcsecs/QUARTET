@@ -212,20 +212,19 @@ check_bluetooth() {
     ((TOTAL_CHECKS++))
 
     local enabled
-    enabled=$(systemctl is-enabled bluetooth 2>/dev/null || echo "disabled")
+    enabled=$(systemctl is-enabled bluetooth 2>/dev/null | head -n1)
+    [ -z "$enabled" ] && enabled="none"
+
     local active
-    active=$(systemctl is-active bluetooth 2>/dev/null || echo "inactive")
+    active=$(systemctl is-active bluetooth 2>/dev/null | head -n1)
+    [ -z "$active" ] && active="inactive"
+
     local loaded
-    if lsmod | grep -q "^bluetooth"; then
-        loaded="Yes"
-    else
-        loaded="No"
-    fi
+    if lsmod | grep -q "^bluetooth"; then loaded="Yes"; else loaded="No"; fi
 
-    local current
-    local status
+    local current status
 
-    if [ "$enabled" = "disabled" ] && [ "$active" = "inactive" ] && [ "$loaded" = "No" ]; then
+    if [[ "$enabled" =~ ^(disabled|masked|static|indirect|none)$ ]] && [ "$active" = "inactive" ] && [ "$loaded" = "No" ]; then
         current="Bluetooth service disabled"
         status="PASS"
         ((PASSED_CHECKS++))
@@ -235,9 +234,8 @@ check_bluetooth() {
         ((FAILED_CHECKS++))
         if [ "$MODE" = "fix" ]; then
             systemctl stop bluetooth >/dev/null 2>&1
-            systemctl disable bluetooth >/dev/null 2>&1
             systemctl mask bluetooth >/dev/null 2>&1
-            modprobe -r bluetooth 2>/dev/null
+            modprobe -r bluetooth >/dev/null 2>&1
             systemctl daemon-reload
             current="Bluetooth service disabled and module removed"
             status="PASS"
