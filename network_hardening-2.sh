@@ -132,7 +132,7 @@ print_check_result() {
 # Network Device Checks
 # ============================================================================
 check_ipv6_status() {
-    local policy_id="NET-DEVC-IPv6"
+    local policy_id="NET-1-a.i"
     local policy_name="Ensure IPv6 status is identified"
     local expected="IPv6 disabled"
     ((TOTAL_CHECKS++))
@@ -166,7 +166,7 @@ check_ipv6_status() {
 }
 
 check_disable_wireless() {
-    local policy_id="NET-DEVC-WIFI"
+    local policy_id="NET-1-a.ii"
     local policy_name="Ensure wireless interfaces are disabled"
     local expected="Wireless disabled"
     ((TOTAL_CHECKS++))
@@ -206,7 +206,7 @@ check_disable_wireless() {
 }
 
 check_bluetooth() {
-    local policy_id="NET-DEVC-BLUETOOTH"
+    local policy_id="NET-1-a.iii"
     local policy_name="Ensure Bluetooth service is not in use"
     local expected="Bluetooth disabled"
     ((TOTAL_CHECKS++))
@@ -292,10 +292,10 @@ disable_module_rule() {
     fi
 }
 
-check_dccp() { disable_module_rule "dccp" "NET-MOD-DCCP" "Ensure dccp kernel module is not available"; }
-check_tipc() { disable_module_rule "tipc" "NET-MOD-TIPC" "Ensure tipc kernel module is not available"; }
-check_rds()  { disable_module_rule "rds"  "NET-MOD-RDS"  "Ensure rds kernel module is not available"; }
-check_sctp() { disable_module_rule "sctp" "NET-MOD-SCTP" "Ensure sctp kernel module is not available"; }
+check_dccp() { disable_module_rule "dccp" "NET-1-b.i" "Ensure dccp kernel module is not available"; }
+check_tipc() { disable_module_rule "tipc" "NET-1-b.ii" "Ensure tipc kernel module is not available"; }
+check_rds()  { disable_module_rule "rds"  "NET-1-b.iii"  "Ensure rds kernel module is not available"; }
+check_sctp() { disable_module_rule "sctp" "NET-1-b.iv" "Ensure sctp kernel module is not available"; }
 
 # ============================================================================
 # Sysctl Kernel Parameter Checks
@@ -337,17 +337,17 @@ sysctl_rule() {
     fi
 }
 
-check_ip_forwarding()            { sysctl_rule "NET-PAR-FWD"      "Ensure IP forwarding is disabled"             "net.ipv4.ip_forward" "0"; }
-check_redirect_sending()         { sysctl_rule "NET-PAR-REDIR"    "Ensure packet redirect sending is disabled"   "net.ipv4.conf.all.send_redirects" "0"; }
-check_bogus_icmp()               { sysctl_rule "NET-PAR-BOGUS"    "Ensure bogus ICMP responses are ignored"      "net.ipv4.icmp_ignore_bogus_error_responses" "1"; }
-check_broadcast_icmp()           { sysctl_rule "NET-PAR-BCAST"    "Ensure broadcast ICMP requests are ignored"   "net.ipv4.icmp_echo_ignore_broadcasts" "1"; }
-check_icmp_redirects()           { sysctl_rule "NET-PAR-ICMPRED"  "Ensure ICMP redirects are not accepted"       "net.ipv4.conf.all.accept_redirects" "0"; }
-check_secure_redirects()         { sysctl_rule "NET-PAR-SREDIR"   "Ensure secure ICMP redirects are not accepted" "net.ipv4.conf.all.secure_redirects" "0"; }
-check_reverse_path_filter()      { sysctl_rule "NET-PAR-RPF"      "Ensure reverse path filtering is enabled"      "net.ipv4.conf.all.rp_filter" "1"; }
-check_source_routing()           { sysctl_rule "NET-PAR-SROUTE"   "Ensure source routed packets are not accepted" "net.ipv4.conf.all.accept_source_route" "0"; }
-check_log_martians()             { sysctl_rule "NET-PAR-MART"     "Ensure suspicious packets are logged"         "net.ipv4.conf.all.log_martians" "1"; }
-check_syn_cookies()              { sysctl_rule "NET-PAR-SYNC"     "Ensure TCP SYN cookies are enabled"           "net.ipv4.tcp_syncookies" "1"; }
-check_ipv6_ra()                  { sysctl_rule "NET-PAR-RA"       "Ensure IPv6 router advertisements are not accepted" "net.ipv6.conf.all.accept_ra" "0"; }
+check_ip_forwarding()            { sysctl_rule "NET-1-c.i"      "Ensure IP forwarding is disabled"             "net.ipv4.ip_forward" "0"; }
+check_redirect_sending()         { sysctl_rule "NET-1-c.ii"    "Ensure packet redirect sending is disabled"   "net.ipv4.conf.all.send_redirects" "0"; }
+check_bogus_icmp()               { sysctl_rule "NET-1-c.iii"    "Ensure bogus ICMP responses are ignored"      "net.ipv4.icmp_ignore_bogus_error_responses" "1"; }
+check_broadcast_icmp()           { sysctl_rule "NET-1-c.iv"    "Ensure broadcast ICMP requests are ignored"   "net.ipv4.icmp_echo_ignore_broadcasts" "1"; }
+check_icmp_redirects()           { sysctl_rule "NET-1-c.v"  "Ensure ICMP redirects are not accepted"       "net.ipv4.conf.all.accept_redirects" "0"; }
+check_secure_redirects()         { sysctl_rule "NET-1-c.vi"   "Ensure secure ICMP redirects are not accepted" "net.ipv4.conf.all.secure_redirects" "0"; }
+check_reverse_path_filter()      { sysctl_rule "NET-1-c.vii"      "Ensure reverse path filtering is enabled"      "net.ipv4.conf.all.rp_filter" "1"; }
+check_source_routing()           { sysctl_rule "NET-1-c.viii"   "Ensure source routed packets are not accepted" "net.ipv4.conf.all.accept_source_route" "0"; }
+check_log_martians()             { sysctl_rule "NET-1-c.ix"     "Ensure suspicious packets are logged"         "net.ipv4.conf.all.log_martians" "1"; }
+check_syn_cookies()              { sysctl_rule "NET-1-c.x"     "Ensure TCP SYN cookies are enabled"           "net.ipv4.tcp_syncookies" "1"; }
+check_ipv6_ra()                  { sysctl_rule "NET-1-c.xi"       "Ensure IPv6 router advertisements are not accepted" "net.ipv6.conf.all.accept_ra" "0"; }
 
 # ============================================================================
 # Main Execution
