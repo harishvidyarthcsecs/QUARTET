@@ -175,7 +175,7 @@ class HardeningApp:
         stats_frame.pack(fill=tk.X, padx=10, pady=(20, 10))
         
         self.stats_vars = {
-            "Total Modules": tk.StringVar(value="8"),
+            "Total Modules": tk.StringVar(value="9"),
             "Total Policies": tk.StringVar(value="0"),
             "Last Scan": tk.StringVar(value="Never"),
             "Database": tk.StringVar(value="Connected" if self.conn else "Error"),
