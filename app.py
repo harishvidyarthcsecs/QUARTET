@@ -10,10 +10,14 @@ import os
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+import re
 
-# -------------------------
-# CONFIG: Modules & scripts
-# -------------------------
 MODULES = [
     ("Access Control", "access_control.sh"),
     ("Package Management", "package_mgmt.sh"),
@@ -38,27 +42,23 @@ ROLLBACK_SCRIPTS = {
     "Logging and Auditing": "logging_auditing_rollback.sh",
 }
 
-# Colors - Blue Theme
-BG_COLOR = "#f0f8ff"  # Alice Blue
-HEADER_COLOR = "#1e88e5"  # Bright Blue
-SIDEBAR_COLOR = "#bbdefb"  # Light Blue
-BUTTON_COLOR = "#2196f3"  # Material Blue
-BUTTON_HOVER = "#1976d2"  # Darker Blue
-TEXT_COLOR = "#212121"  # Dark Gray
-COLOR_PASS = "#4caf50"  # Green
-COLOR_FAIL = "#f44336"  # Red
-COLOR_WARN = "#ff9800"  # Orange
-COLOR_INFO = "#2196f3"  # Blue
-COLOR_FIXED = "#673ab7"  # Purple
-COLOR_MANUAL = "#ff9800"  # Orange
-COLOR_RUNNING = "#9c27b0"  # Purple
-COLOR_NORMAL = "#212121"  # Dark Gray
+BG_COLOR = "#f0f8ff"
+HEADER_COLOR = "#1e88e5"
+SIDEBAR_COLOR = "#bbdefb"
+BUTTON_COLOR = "#2196f3"
+BUTTON_HOVER = "#1976d2"
+TEXT_COLOR = "#212121"
+COLOR_PASS = "#4caf50"
+COLOR_FAIL = "#f44336"
+COLOR_WARN = "#ff9800"
+COLOR_INFO = "#2196f3"
+COLOR_FIXED = "#673ab7"
+COLOR_MANUAL = "#ff9800"
+COLOR_RUNNING = "#9c27b0"
+COLOR_NORMAL = "#212121"
 
 DB_FILE = "/home/kali/hardening.db"
 
-# -------------------------
-# Helper: Run subprocess streaming
-# -------------------------
 def run_command_stream(cmd, line_callback, done_callback=None, progress_callback=None):
     try:
         proc = subprocess.Popen(cmd,
@@ -90,9 +90,290 @@ def run_command_stream(cmd, line_callback, done_callback=None, progress_callback
     if done_callback:
         done_callback(proc.returncode)
 
-# -------------------------
-# Main Application
-# -------------------------
+class PDFReportGenerator:
+    def __init__(self, db_conn):
+        self.db = db_conn
+    
+    def generate_report(self, module_name=None, output_path=None):
+        if output_path is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            if module_name:
+                output_path = f"hardening_report_{module_name}_{timestamp}.pdf"
+            else:
+                output_path = f"hardening_report_all_{timestamp}.pdf"
+        
+        doc = SimpleDocTemplate(output_path, pagesize=A4)
+        story = []
+        
+        styles = getSampleStyleSheet()
+        
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=20,
+            alignment=TA_CENTER,
+            spaceAfter=30,
+            textColor=colors.HexColor('#1e88e5')
+        )
+        
+        story.append(Paragraph("Linux Hardening Compliance Report", title_style))
+        story.append(Spacer(1, 10))
+        
+        meta_text = f"""
+        <b>Report Generated:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/>
+        <b>Module:</b> {module_name if module_name else 'All Modules'}<br/>
+        <b>Report ID:</b> {hashlib.md5(str(datetime.datetime.now()).encode()).hexdigest()[:16].upper()}
+        """
+        story.append(Paragraph(meta_text, styles["Normal"]))
+        story.append(Spacer(1, 20))
+        
+        cursor = self.db.cursor()
+        
+        if module_name:
+            cursor.execute("""
+                SELECT policy_id, policy_name, expected_value, current_value, status 
+                FROM scan_results 
+                WHERE module_name=?
+                ORDER BY policy_id
+            """, (module_name,))
+        else:
+            cursor.execute("""
+                SELECT module_name, policy_id, policy_name, expected_value, current_value, status 
+                FROM scan_results 
+                ORDER BY module_name, policy_id
+            """)
+        
+        rows = cursor.fetchall()
+        
+        if not rows:
+            story.append(Paragraph("No scan results available.", styles["Normal"]))
+        else:
+            if module_name:
+                data = [["ID", "Policy Name", "Expected", "Current", "Status"]]
+                for row in rows:
+                    data.append([
+                        row['policy_id'],
+                        row['policy_name'][:50],
+                        str(row['expected_value'])[:30],
+                        str(row['current_value'])[:30],
+                        row['status']
+                    ])
+                col_widths = [0.5*inch, 2.5*inch, 1.2*inch, 1.2*inch, 0.8*inch]
+            else:
+                data = [["Module", "ID", "Policy Name", "Status"]]
+                for row in rows:
+                    data.append([
+                        row['module_name'],
+                        row['policy_id'],
+                        row['policy_name'][:40],
+                        row['status']
+                    ])
+                col_widths = [1*inch, 0.5*inch, 2.5*inch, 0.8*inch]
+            
+            table = Table(data, colWidths=col_widths)
+            
+            style = TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ])
+            
+            for i in range(1, len(data)):
+                status = data[i][-1]
+                if status == "PASS":
+                    style.add('BACKGROUND', (-1, i), (-1, i), colors.lightgreen)
+                elif status == "FAIL":
+                    style.add('BACKGROUND', (-1, i), (-1, i), colors.pink)
+                elif status == "MANUAL":
+                    style.add('BACKGROUND', (-1, i), (-1, i), colors.lightyellow)
+            
+            table.setStyle(style)
+            story.append(table)
+            story.append(Spacer(1, 20))
+            
+            cursor.execute("""
+                SELECT status, COUNT(*) as count 
+                FROM scan_results 
+                WHERE module_name=? OR ? IS NULL
+                GROUP BY status
+            """, (module_name, module_name))
+            
+            stats = cursor.fetchall()
+            
+            summary_text = "<b>Compliance Summary:</b><br/>"
+            for stat in stats:
+                summary_text += f"{stat['status']}: {stat['count']} policies<br/>"
+            
+            story.append(Paragraph(summary_text, styles["Normal"]))
+        
+        story.append(Spacer(1, 30))
+        story.append(Paragraph("="*50, styles["Normal"]))
+        
+        report_data = str(rows) + str(datetime.datetime.now())
+        report_hash = hashlib.sha256(report_data.encode()).hexdigest()
+        
+        integrity_text = f"""
+        <b>Integrity Verification:</b><br/>
+        <font size="8">Hash: {report_hash[:32]}...<br/>
+        Generated at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/>
+        To verify: Compare this hash with stored hash in database.</font>
+        """
+        story.append(Paragraph(integrity_text, styles["Normal"]))
+        
+        doc.build(story)
+        
+        self.store_report_hash(output_path, report_hash, module_name)
+        
+        return output_path, report_hash
+    
+    def store_report_hash(self, filename, report_hash, module_name):
+        try:
+            cursor = self.db.cursor()
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS report_hashes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    module_name TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                INSERT INTO report_hashes (filename, hash, module_name) 
+                VALUES (?, ?, ?)
+            ''', (filename, report_hash, module_name))
+            
+            self.db.commit()
+            return True
+        except Exception as e:
+            print(f"Error storing hash: {e}")
+            return False
+    
+    def verify_report(self, filename):
+        try:
+            with open(filename, 'rb') as f:
+                content = f.read()
+            
+            content_str = content.decode('latin-1', errors='ignore')
+            
+            hash_match = re.search(r'Hash: ([a-fA-F0-9]{64})', content_str)
+            
+            if not hash_match:
+                return False, "No hash found in PDF"
+            
+            file_hash = hash_match.group(1)
+            
+            cursor = self.db.cursor()
+            cursor.execute('''
+                SELECT hash FROM report_hashes 
+                WHERE filename=? OR hash LIKE ?
+                ORDER BY created_at DESC LIMIT 1
+            ''', (filename, f"{file_hash[:20]}%"))
+            
+            result = cursor.fetchone()
+            
+            if result:
+                db_hash = result['hash']
+                if file_hash == db_hash:
+                    return True, "✓ Report is authentic (not tampered)"
+                else:
+                    return False, "✗ Report has been modified!"
+            else:
+                return False, "✗ Report not found in database"
+                
+        except Exception as e:
+            return False, f"Verification error: {str(e)}"
+
+class SimpleBlockchainVerifier:
+    def __init__(self, db_conn):
+        self.db = db_conn
+        self.init_blockchain_table()
+    
+    def init_blockchain_table(self):
+        cursor = self.db.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS blockchain_ledger (
+                block_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                previous_hash TEXT,
+                current_hash TEXT NOT NULL,
+                data_hash TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                module_name TEXT,
+                action_type TEXT,
+                description TEXT
+            )
+        ''')
+        self.db.commit()
+    
+    def add_to_blockchain(self, data, module_name="", action_type="", description=""):
+        try:
+            data_hash = hashlib.sha256(str(data).encode()).hexdigest()
+            
+            cursor = self.db.cursor()
+            cursor.execute("SELECT current_hash FROM blockchain_ledger ORDER BY block_id DESC LIMIT 1")
+            result = cursor.fetchone()
+            previous_hash = result['current_hash'] if result else "0" * 64
+            
+            combined = previous_hash + data_hash
+            current_hash = hashlib.sha256(combined.encode()).hexdigest()
+            
+            cursor.execute('''
+                INSERT INTO blockchain_ledger 
+                (previous_hash, current_hash, data_hash, module_name, action_type, description)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (previous_hash, current_hash, data_hash, module_name, action_type, description))
+            
+            self.db.commit()
+            
+            return {
+                'block_id': cursor.lastrowid,
+                'current_hash': current_hash,
+                'data_hash': data_hash,
+                'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+        except Exception as e:
+            print(f"Blockchain error: {e}")
+            return None
+    
+    def verify_chain(self):
+        try:
+            cursor = self.db.cursor()
+            cursor.execute("SELECT * FROM blockchain_ledger ORDER BY block_id")
+            blocks = cursor.fetchall()
+            
+            if not blocks:
+                return True, "Chain is empty"
+            
+            previous_hash = "0" * 64
+            
+            for block in blocks:
+                combined = previous_hash + block['data_hash']
+                calculated_hash = hashlib.sha256(combined.encode()).hexdigest()
+                
+                if calculated_hash != block['current_hash']:
+                    return False, f"Chain broken at block {block['block_id']}"
+                
+                previous_hash = block['current_hash']
+            
+            return True, f"✓ Blockchain verified ({len(blocks)} blocks intact)"
+            
+        except Exception as e:
+            return False, f"Verification error: {str(e)}"
+    
+    def get_latest_hash(self):
+        cursor = self.db.cursor()
+        cursor.execute("SELECT current_hash FROM blockchain_ledger ORDER BY block_id DESC LIMIT 1")
+        result = cursor.fetchone()
+        return result['current_hash'] if result else None
+
 class HardeningApp:
     def __init__(self, root):
         self.root = root
@@ -104,28 +385,24 @@ class HardeningApp:
         self.current_action = None
         self.filter_text = ""
 
-        # Initialize database connection
         try:
+            os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
             self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
+            self.init_database()
         except Exception as e:
             messagebox.showerror("Database Error", f"Cannot connect to database:\n{DB_FILE}\nError: {e}")
             self.conn = None
 
-        # -------------------------
-        # Left Panel: Module List
-        # -------------------------
         self.left_frame = tk.Frame(root, bg=SIDEBAR_COLOR, width=260, relief=tk.RAISED, borderwidth=2)
         self.left_frame.pack(side=tk.LEFT, fill=tk.Y)
         self.left_frame.pack_propagate(False)
         
-        # Header
         header_left = tk.Frame(self.left_frame, bg=HEADER_COLOR, height=60)
         header_left.pack(fill=tk.X)
         tk.Label(header_left, text="HARDENING", fg="white", bg=HEADER_COLOR, 
                 font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT, padx=15, pady=10)
         
-        # Modules Section
         modules_frame = LabelFrame(self.left_frame, text=" MODULES ", font=("Segoe UI", 11, "bold"),
                                   bg=SIDEBAR_COLOR, fg=TEXT_COLOR, relief=tk.FLAT, borderwidth=0)
         modules_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
@@ -142,13 +419,11 @@ class HardeningApp:
                          command=lambda i=idx: self.select_module(i))
             b.pack(side=tk.LEFT, padx=5)
             
-            # Add hover effect
             b.bind("<Enter>", lambda e, b=b: b.configure(bg="#90caf9"))
             b.bind("<Leave>", lambda e, b=b: b.configure(bg=SIDEBAR_COLOR))
             
             self.module_buttons.append(b)
 
-        # Actions Section
         actions_frame = LabelFrame(self.left_frame, text=" ACTIONS ", font=("Segoe UI", 11, "bold"),
                                   bg=SIDEBAR_COLOR, fg=TEXT_COLOR, relief=tk.FLAT, borderwidth=0)
         actions_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
@@ -169,7 +444,6 @@ class HardeningApp:
             btn.bind("<Enter>", lambda e, b=btn: b.configure(relief=tk.SUNKEN))
             btn.bind("<Leave>", lambda e, b=btn: b.configure(relief=tk.RAISED))
 
-        # Stats Section
         stats_frame = LabelFrame(self.left_frame, text=" SYSTEM INFO ", font=("Segoe UI", 11, "bold"),
                                 bg=SIDEBAR_COLOR, fg=TEXT_COLOR, relief=tk.FLAT, borderwidth=0)
         stats_frame.pack(fill=tk.X, padx=10, pady=(20, 10))
@@ -189,13 +463,9 @@ class HardeningApp:
             tk.Label(stat_frame, textvariable=var, bg=SIDEBAR_COLOR, fg="#1e88e5",
                     font=("Segoe UI", 9, "bold")).pack(side=tk.RIGHT, padx=5)
 
-        # -------------------------
-        # Right Panel: Main
-        # -------------------------
         self.main_frame = tk.Frame(root, bg=BG_COLOR)
         self.main_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Header
         header_frame = tk.Frame(self.main_frame, bg=HEADER_COLOR, height=70)
         header_frame.pack(fill=tk.X)
         
@@ -207,19 +477,14 @@ class HardeningApp:
         tk.Label(title_frame, text="HARDENING TOOL", fg="white", bg=HEADER_COLOR,
                 font=("Segoe UI", 18, "bold")).pack(anchor="w")
         
-        # Current module display
         self.current_module_var = tk.StringVar(value="Select a Module")
         current_module_label = tk.Label(header_frame, textvariable=self.current_module_var,
                                        fg="white", bg=HEADER_COLOR, font=("Segoe UI", 11, "bold"))
         current_module_label.pack(side=tk.RIGHT, padx=20, pady=10)
 
-        # -------------------------
-        # Control Panel with Progress Bar
-        # -------------------------
         control_frame = tk.Frame(self.main_frame, bg=BG_COLOR)
         control_frame.pack(fill=tk.X, padx=20, pady=(15, 10))
         
-        # Action buttons
         btn_frame = tk.Frame(control_frame, bg=BG_COLOR)
         btn_frame.pack(side=tk.LEFT)
         
@@ -232,7 +497,12 @@ class HardeningApp:
         self.rollback_btn = self.create_action_button(btn_frame, "Rollback", "#f44336", self.start_module_rollback)
         self.rollback_btn.pack(side=tk.LEFT, padx=3)
         
-        # Search/Filter
+        self.pdf_btn = self.create_action_button(btn_frame, "📄 PDF Report", "#673ab7", self.generate_pdf_report)
+        self.pdf_btn.pack(side=tk.LEFT, padx=3)
+        
+        self.blockchain_btn = self.create_action_button(btn_frame, "🔗 Verify", "#009688", self.verify_blockchain)
+        self.blockchain_btn.pack(side=tk.LEFT, padx=3)
+        
         search_frame = tk.Frame(control_frame, bg=BG_COLOR)
         search_frame.pack(side=tk.RIGHT)
         
@@ -255,7 +525,6 @@ class HardeningApp:
                              command=self.clear_filter)
         clear_btn.pack(side=tk.LEFT, padx=2)
 
-        # Progress Bar
         self.progress_frame = tk.Frame(self.main_frame, bg=BG_COLOR)
         self.progress_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
         
@@ -266,26 +535,19 @@ class HardeningApp:
         self.progress_bar = ttk.Progressbar(self.progress_frame, mode='indeterminate', length=400)
         self.progress_bar.pack(fill=tk.X, pady=(2, 0))
         
-        # Initially hide progress bar
         self.progress_frame.pack_forget()
 
-        # -------------------------
-        # Tabs: Policy Table & Console
-        # -------------------------
         self.tabs = ttk.Notebook(self.main_frame)
         self.tabs.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
         
-        # Style the notebook
         style = ttk.Style()
         style.configure("TNotebook", background=BG_COLOR)
         style.configure("TNotebook.Tab", background=SIDEBAR_COLOR, foreground=TEXT_COLOR)
         style.map("TNotebook.Tab", background=[("selected", HEADER_COLOR)])
 
-        # Scan Results Tab
         self.scan_frame = tk.Frame(self.tabs, bg=BG_COLOR)
         self.tabs.add(self.scan_frame, text=" Scan Results ")
         
-        # Table controls
         table_controls = tk.Frame(self.scan_frame, bg=BG_COLOR)
         table_controls.pack(fill=tk.X, padx=5, pady=(5, 0))
         
@@ -302,24 +564,20 @@ class HardeningApp:
                                command=self.refresh_table)
         refresh_btn.pack(side=tk.RIGHT, padx=5)
         
-        # Create Treeview with scrollbars
         tree_frame = tk.Frame(self.scan_frame, bg=BG_COLOR)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Scrollbars
         y_scrollbar = ttk.Scrollbar(tree_frame)
         y_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         x_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
         x_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
         
-        # Treeview
         columns = ("Policy ID", "Policy Name", "Expected", "Current", "Status")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                                 yscrollcommand=y_scrollbar.set,
                                 xscrollcommand=x_scrollbar.set)
         
-        # Configure columns
         col_widths = [120, 250, 150, 150, 100]
         for col, width in zip(columns, col_widths):
             self.tree.heading(col, text=col)
@@ -327,14 +585,11 @@ class HardeningApp:
         
         self.tree.pack(fill=tk.BOTH, expand=True)
         
-        # Configure scrollbars
         y_scrollbar.config(command=self.tree.yview)
         x_scrollbar.config(command=self.tree.xview)
         
-        # Bind double-click for details
         self.tree.bind("<Double-1>", self.show_policy_details)
 
-        # Console Tab
         self.console_frame = tk.Frame(self.tabs, bg=BG_COLOR)
         self.tabs.add(self.console_frame, text=" Console Output ")
         
@@ -354,13 +609,11 @@ class HardeningApp:
                                 command=self.save_log)
         save_log_btn.pack(side=tk.RIGHT, padx=5)
         
-        # Console output
         self.output_box = scrolledtext.ScrolledText(self.console_frame, wrap=tk.WORD,
                                                    font=("Consolas", 10), bg="#fafafa",
                                                    relief=tk.SUNKEN, borderwidth=1)
         self.output_box.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Configure tags for colored output
         self.output_box.tag_config("pass", foreground=COLOR_PASS)
         self.output_box.tag_config("fail", foreground=COLOR_FAIL)
         self.output_box.tag_config("warn", foreground=COLOR_WARN)
@@ -370,7 +623,6 @@ class HardeningApp:
         self.output_box.tag_config("running", foreground=COLOR_RUNNING)
         self.output_box.tag_config("normal", foreground=COLOR_NORMAL)
 
-        # Fix History Tab
         self.history_frame = tk.Frame(self.tabs, bg=BG_COLOR)
         self.tabs.add(self.history_frame, text=" Fix History ")
         
@@ -385,7 +637,6 @@ class HardeningApp:
                                        command=self.load_fix_history)
         refresh_history_btn.pack(side=tk.RIGHT, padx=5)
         
-        # History Treeview
         history_tree_frame = tk.Frame(self.history_frame, bg=BG_COLOR)
         history_tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
@@ -410,13 +661,9 @@ class HardeningApp:
         history_y_scrollbar.config(command=self.history_tree.yview)
         history_x_scrollbar.config(command=self.history_tree.xview)
 
-        # -------------------------
-        # Summary Panel
-        # -------------------------
         summary_frame = tk.Frame(self.main_frame, bg="#e3f2fd", bd=1, relief=tk.RAISED, borderwidth=1)
         summary_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
         
-        # Left side: Compliance Summary
         left_sum = tk.Frame(summary_frame, bg="#e3f2fd")
         left_sum.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=15, pady=10)
         
@@ -439,7 +686,6 @@ class HardeningApp:
         tk.Label(left_sum, textvariable=self.fail_var, bg="#e3f2fd", fg=COLOR_FAIL,
                 font=("Segoe UI", 9)).pack(anchor="w")
         
-        # Right side: Quick Actions & Info
         right_sum = tk.Frame(summary_frame, bg="#e3f2fd")
         right_sum.pack(side=tk.RIGHT, padx=15, pady=10)
         
@@ -462,36 +708,91 @@ class HardeningApp:
                  bg="#9e9e9e", fg="white", font=("Segoe UI", 9),
                  command=self.show_about).pack(side=tk.LEFT, padx=2)
 
-        # -------------------------
-        # Initialize
-        # -------------------------
         self.reset_counters()
         if self.conn:
             self.select_module(0)
         else:
             self.append_console("[ERROR] Database not connected. Check DB_FILE path.")
 
+    def init_database(self):
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scan_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                policy_id TEXT NOT NULL,
+                policy_name TEXT NOT NULL,
+                expected_value TEXT,
+                current_value TEXT,
+                status TEXT,
+                module_name TEXT,
+                scan_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS fix_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                policy_id TEXT NOT NULL,
+                policy_name TEXT NOT NULL,
+                original_value TEXT,
+                current_value TEXT,
+                status TEXT,
+                module_name TEXT,
+                fix_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS blockchain_ledger (
+                block_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                previous_hash TEXT,
+                current_hash TEXT NOT NULL,
+                data_hash TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                module_name TEXT,
+                action_type TEXT,
+                description TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS report_hashes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                module_name TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.conn.commit()
+        
+        blockchain = SimpleBlockchainVerifier(self.conn)
+        cursor.execute("SELECT COUNT(*) as count FROM blockchain_ledger")
+        if cursor.fetchone()['count'] == 0:
+            blockchain.add_to_blockchain(
+                data="GENESIS_BLOCK",
+                module_name="SYSTEM",
+                action_type="INIT",
+                description="Initial blockchain genesis block"
+            )
+
     def create_action_button(self, parent, text, color, command):
-        """Create a styled action button"""
         btn = tk.Button(parent, text=text, width=10, height=1,
                        font=("Segoe UI", 10, "bold"),
                        bg=color, fg="white",
                        relief=tk.RAISED, borderwidth=2,
                        command=command)
-        # Hover effects
         btn.bind("<Enter>", lambda e, b=btn: b.configure(relief=tk.SUNKEN))
         btn.bind("<Leave>", lambda e, b=btn: b.configure(relief=tk.RAISED))
         return btn
 
-    # -------------------------
-    # Module & Table Management
-    # -------------------------
     def select_module(self, idx):
         self.current_module_index = idx
         module_name = MODULES[idx][0]
         self.current_module_var.set(f"Module: {module_name}")
         
-        # Update button states
         for i, b in enumerate(self.module_buttons):
             if i == idx:
                 b.configure(bg="#90caf9", relief=tk.SUNKEN)
@@ -532,13 +833,10 @@ class HardeningApp:
                 self.append_console(f"[INFO] No scan results found for {module_name}. Run a scan first.")
                 return
             
-            # Update stats
             self.stats_vars["Total Policies"].set(str(len(rows)))
             
-            # FIX: Convert sqlite3.Row objects to regular tuples/lists
             converted_rows = []
             for row in rows:
-                # Extract values from the sqlite3.Row object
                 converted_row = (
                     row['policy_id'],
                     row['policy_name'],
@@ -548,7 +846,6 @@ class HardeningApp:
                 )
                 converted_rows.append(converted_row)
             
-            # Filter rows based on search text
             filtered_rows = converted_rows
             if self.filter_text:
                 filtered_rows = [
@@ -561,11 +858,9 @@ class HardeningApp:
                 status = r[4].lower() if r[4] else "normal"
                 self.tree.insert("", tk.END, values=r, tags=(status,))
             
-            # Update counters and summary
             self.update_counts_from_db(converted_rows)
             self.update_summary()
             
-            # Configure tag colors
             for status, color in [
                 ("pass", COLOR_PASS), ("fail", COLOR_FAIL),
                 ("manual", COLOR_MANUAL), ("fixed", COLOR_FIXED)
@@ -599,7 +894,6 @@ class HardeningApp:
             rows = cursor.fetchall()
             
             for r in rows:
-                # Convert sqlite3.Row to tuple for display
                 converted_row = (
                     r['policy_id'],
                     r['policy_name'],
@@ -614,14 +908,12 @@ class HardeningApp:
             self.append_console(f"[ERROR] Failed to load fix history: {e}")
 
     def filter_table(self, event=None):
-        """Filter table based on search text"""
         self.filter_text = self.search_var.get().strip()
         if self.current_module_index < len(MODULES):
             module_name = MODULES[self.current_module_index][0]
             self.load_scan_results(module_name)
 
     def clear_filter(self):
-        """Clear search filter"""
         self.search_var.set("")
         self.filter_text = ""
         if self.current_module_index < len(MODULES):
@@ -629,14 +921,12 @@ class HardeningApp:
             self.load_scan_results(module_name)
 
     def refresh_table(self):
-        """Refresh the current table view"""
         if self.current_module_index < len(MODULES):
             module_name = MODULES[self.current_module_index][0]
             self.load_scan_results(module_name)
             self.load_fix_history()
 
     def show_policy_details(self, event):
-        """Show details when a policy is double-clicked"""
         selection = self.tree.selection()
         if not selection:
             return
@@ -652,12 +942,10 @@ class HardeningApp:
         details_window.geometry("500x400")
         details_window.configure(bg=BG_COLOR)
         
-        # Create a scrolled text widget for details
         details_text = scrolledtext.ScrolledText(details_window, wrap=tk.WORD,
                                                 font=("Consolas", 10), bg="#fafafa")
         details_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Format details
         details = f"""POLICY DETAILS
 {"="*50}
 Policy ID:     {values[0]}
@@ -673,9 +961,6 @@ Module:        {MODULES[self.current_module_index][0]}
         details_text.insert(tk.END, details)
         details_text.config(state=tk.DISABLED)
 
-    # -------------------------
-    # Console Output
-    # -------------------------
     def append_console(self, line):
         line = line.rstrip("\n")
         tag = "normal"
@@ -698,7 +983,6 @@ Module:        {MODULES[self.current_module_index][0]}
         self.output_box.insert(tk.END, line + "\n", tag)
         self.output_box.see(tk.END)
         
-        # Update counters from console output
         if tag == "pass":
             self.count_pass += 1
             self.total_checks += 1
@@ -746,9 +1030,6 @@ Module:        {MODULES[self.current_module_index][0]}
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save log:\n{e}")
 
-    # -------------------------
-    # Progress Bar Management
-    # -------------------------
     def show_progress(self, message):
         self.progress_label.config(text=message)
         self.progress_frame.pack(fill=tk.X, padx=20, pady=(0, 10))
@@ -764,9 +1045,166 @@ Module:        {MODULES[self.current_module_index][0]}
             self.progress_bar["value"] = value
             self.root.update_idletasks()
 
-    # -------------------------
-    # Actions and Execution
-    # -------------------------
+    def generate_pdf_report(self):
+        if not self.conn:
+            messagebox.showerror("Error", "Database not connected")
+            return
+        
+        choice = messagebox.askquestion("PDF Report", 
+                                   "Generate report for current module only?\n\n"
+                                   "Yes = Current module only\n"
+                                   "No = All modules")
+    
+        module_name = None
+        if choice == 'yes':
+            if self.current_module_index < len(MODULES):
+                module_name = MODULES[self.current_module_index][0]
+            else:
+                module_name = "Unknown"
+    
+        try:
+            self.show_progress("Generating PDF report...")
+            
+            pdf_gen = PDFReportGenerator(self.conn)
+            
+            filename, report_hash = pdf_gen.generate_report(module_name)
+            
+            blockchain = SimpleBlockchainVerifier(self.conn)
+            tx = blockchain.add_to_blockchain(
+                data=report_hash,
+                module_name=module_name or "ALL",
+                action_type="PDF_REPORT",
+                description=f"PDF report generated: {os.path.basename(filename)}"
+            )
+            
+            self.hide_progress()
+            
+            if tx:
+                msg = f"✅ PDF Report Generated Successfully!\n\n"
+                msg += f"File: {filename}\n"
+                msg += f"Blockchain TX: {tx['current_hash'][:16]}...\n"
+                msg += f"Timestamp: {tx['timestamp']}"
+            else:
+                msg = f"✅ PDF Report Generated!\n\nFile: {filename}"
+            
+            if messagebox.askyesno("Report Generated", msg + "\n\nOpen PDF file?"):
+                if os.name == 'nt':
+                    os.startfile(filename)
+                else:
+                    os.system(f"xdg-open '{filename}'")
+            
+            short_hash = report_hash[:16].upper()
+            self.hash_var.set(f"Report ID: {short_hash} (PDF)")
+        
+        except Exception as e:
+            self.hide_progress()
+            messagebox.showerror("PDF Generation Error", f"Failed to generate PDF:\n{str(e)}")
+
+    def verify_blockchain(self):
+        if not self.conn:
+            messagebox.showerror("Error", "Database not connected")
+            return
+        
+        options = ["Verify Blockchain Chain", "Verify PDF Report", "View Blockchain"]
+        choice = tk.StringVar(value=options[0])
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Blockchain Verification")
+        dialog.geometry("400x200")
+        dialog.configure(bg=BG_COLOR)
+        
+        tk.Label(dialog, text="Select Verification Type:", 
+                 bg=BG_COLOR, fg=TEXT_COLOR, font=("Segoe UI", 11)).pack(pady=10)
+        
+        for option in options:
+            tk.Radiobutton(dialog, text=option, variable=choice, value=option,
+                          bg=BG_COLOR, fg=TEXT_COLOR).pack(anchor="w", padx=30)
+        
+        def perform_verification():
+            selected = choice.get()
+            dialog.destroy()
+            
+            if selected == "Verify Blockchain Chain":
+                self.verify_blockchain_chain()
+            elif selected == "Verify PDF Report":
+                self.verify_pdf_report()
+            elif selected == "View Blockchain":
+                self.view_blockchain()
+        
+        tk.Button(dialog, text="Verify", bg=BUTTON_COLOR, fg="white",
+                 command=perform_verification).pack(pady=20)
+
+    def verify_blockchain_chain(self):
+        blockchain = SimpleBlockchainVerifier(self.conn)
+        is_valid, message = blockchain.verify_chain()
+        
+        if is_valid:
+            messagebox.showinfo("Blockchain Verified", f"✅ {message}")
+        else:
+            messagebox.showerror("Blockchain Error", f"❌ {message}")
+
+    def verify_pdf_report(self):
+        filename = filedialog.askopenfilename(
+            title="Select PDF Report to Verify",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        )
+        
+        if not filename:
+            return
+        
+        pdf_gen = PDFReportGenerator(self.conn)
+        is_valid, message = pdf_gen.verify_report(filename)
+        
+        if is_valid:
+            messagebox.showinfo("Report Verified", f"✅ {message}")
+        else:
+            messagebox.showerror("Report Tampered", f"❌ {message}")
+
+    def view_blockchain(self):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT block_id, module_name, action_type, 
+                       SUBSTR(current_hash, 1, 16) as short_hash, 
+                       timestamp, description
+                FROM blockchain_ledger 
+                ORDER BY block_id DESC
+                LIMIT 50
+            """)
+            rows = cursor.fetchall()
+            
+            window = tk.Toplevel(self.root)
+            window.title("Blockchain Ledger")
+            window.geometry("800x500")
+            window.configure(bg=BG_COLOR)
+            
+            tk.Label(window, text="🔗 Blockchain Transaction Ledger", 
+                    bg=BG_COLOR, fg=TEXT_COLOR, font=("Segoe UI", 14, "bold")).pack(pady=10)
+            
+            text = scrolledtext.ScrolledText(window, wrap=tk.WORD, 
+                                            font=("Consolas", 9), bg="#fafafa")
+            text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            if not rows:
+                text.insert(tk.END, "No blockchain transactions yet.")
+            else:
+                text.insert(tk.END, f"Total Blocks: {len(rows)}\n")
+                text.insert(tk.END, "="*80 + "\n\n")
+                
+                for row in rows:
+                    text.insert(tk.END, f"Block #{row['block_id']}\n")
+                    text.insert(tk.END, f"  Module: {row['module_name']}\n")
+                    text.insert(tk.END, f"  Action: {row['action_type']}\n")
+                    text.insert(tk.END, f"  Hash: {row['short_hash']}...\n")
+                    text.insert(tk.END, f"  Time: {row['timestamp']}\n")
+                    text.insert(tk.END, f"  Desc: {row['description']}\n")
+                    text.insert(tk.END, "-"*40 + "\n")
+            
+            text.config(state=tk.DISABLED)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load blockchain: {str(e)}")
+
     def start_action(self, action):
         if self.running_proc:
             messagebox.showwarning("Running", "Another action is running. Please wait.")
@@ -789,6 +1227,18 @@ Module:        {MODULES[self.current_module_index][0]}
         
         self.current_action = action
         cmd = ["sudo", "bash", fname, action]
+        
+        if self.conn:
+            try:
+                blockchain = SimpleBlockchainVerifier(self.conn)
+                blockchain.add_to_blockchain(
+                    data=f"{title}_{action}",
+                    module_name=title,
+                    action_type=action.upper(),
+                    description=f"Started {action} on {title} module"
+                )
+            except:
+                pass
         
         self.append_console("="*80)
         self.append_console(f"{title} - {action.upper()} - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -818,14 +1268,12 @@ Module:        {MODULES[self.current_module_index][0]}
                 self.clear_console()
                 self.current_module_var.set(f"Module: {MODULES[idx][0]}")
                 
-                # Update button state
                 for i, b in enumerate(self.module_buttons):
                     if i == idx:
                         b.configure(bg="#90caf9", relief=tk.SUNKEN)
                     else:
                         b.configure(bg=SIDEBAR_COLOR, relief=tk.FLAT)
                 
-                # Run the action
                 title, fname = MODULES[idx]
                 cmd = ["sudo", "bash", fname, action]
                 
@@ -842,15 +1290,12 @@ Module:        {MODULES[self.current_module_index][0]}
                     self.append_console("="*80)
                     self.hide_progress()
                     
-                    # Load results
                     if self.conn:
                         self.root.after(100, lambda: self.load_scan_results(title))
                         self.root.after(100, lambda: self.load_fix_history())
                     
-                    # Run next module
                     self.root.after(500, lambda: run_next(idx + 1))
                 
-                # Run in thread
                 t = threading.Thread(target=lambda: run_command_stream(cmd, on_line, on_done))
                 t.daemon = True
                 t.start()
@@ -964,25 +1409,31 @@ Module:        {MODULES[self.current_module_index][0]}
             
             self.append_console(f"[INFO] {title} finished with exit code {returncode} ({status})")
             
-            # Refresh data
             if self.conn and self.current_module_index < len(MODULES):
                 module_name = MODULES[self.current_module_index][0]
                 self.root.after(500, lambda: self.load_scan_results(module_name))
                 self.root.after(500, lambda: self.load_fix_history())
+                
+                try:
+                    blockchain = SimpleBlockchainVerifier(self.conn)
+                    blockchain.add_to_blockchain(
+                        data=f"{module_name}_{action}_{returncode}",
+                        module_name=module_name,
+                        action_type=f"{action.upper()}_COMPLETE",
+                        description=f"Completed {action} on {module_name} with code {returncode}"
+                    )
+                except:
+                    pass
             
-            # Update last scan time
             if action == "scan":
                 self.stats_vars["Last Scan"].set(datetime.datetime.now().strftime("%H:%M"))
         
         run_command_stream(cmd, on_line, on_done)
 
     def _set_buttons_state(self, state):
-        for w in [self.scan_btn, self.fix_btn, self.rollback_btn]:
+        for w in [self.scan_btn, self.fix_btn, self.rollback_btn, self.pdf_btn, self.blockchain_btn]:
             w.configure(state=state)
 
-    # -------------------------
-    # Export Functions
-    # -------------------------
     def export_to_excel(self):
         if not self.conn:
             messagebox.showerror("Database Error", "Database not connected.")
@@ -1001,19 +1452,16 @@ Module:        {MODULES[self.current_module_index][0]}
             return
         
         try:
-            # Create Excel workbook
             wb = Workbook()
             ws = wb.active
             ws.title = "Scan Results"
             
-            # Write headers
             headers = ["Policy ID", "Policy Name", "Expected Value", "Current Value", "Status", "Module", "Timestamp"]
             for col_num, header in enumerate(headers, 1):
                 cell = ws.cell(row=1, column=col_num, value=header)
                 cell.font = Font(bold=True)
                 cell.fill = PatternFill(start_color="FFE0E0E0", end_color="FFE0E0E0", fill_type="solid")
             
-            # Get data from database
             cursor = self.conn.cursor()
             cursor.execute("""
                 SELECT policy_id, policy_name, expected_value, current_value, status, module_name, scan_timestamp
@@ -1023,9 +1471,7 @@ Module:        {MODULES[self.current_module_index][0]}
             """, (module_name,))
             rows = cursor.fetchall()
             
-            # Write data
             for row_num, row in enumerate(rows, 2):
-                # Convert sqlite3.Row to tuple
                 row_data = (
                     row['policy_id'],
                     row['policy_name'],
@@ -1039,8 +1485,7 @@ Module:        {MODULES[self.current_module_index][0]}
                 for col_num, value in enumerate(row_data, 1):
                     ws.cell(row=row_num, column=col_num, value=value)
                     
-                    # Color code based on status
-                    if col_num == 5:  # Status column
+                    if col_num == 5:
                         if row_data[4] == "PASS":
                             ws.cell(row=row_num, column=col_num).fill = PatternFill(
                                 start_color="FFC6EFCE", end_color="FFC6EFCE", fill_type="solid")
@@ -1051,7 +1496,6 @@ Module:        {MODULES[self.current_module_index][0]}
                             ws.cell(row=row_num, column=col_num).fill = PatternFill(
                                 start_color="FFFFEB9C", end_color="FFFFEB9C", fill_type="solid")
             
-            # Auto-adjust column widths
             for column in ws.columns:
                 max_length = 0
                 column_letter = column[0].column_letter
@@ -1064,7 +1508,6 @@ Module:        {MODULES[self.current_module_index][0]}
                 adjusted_width = min(max_length + 2, 50)
                 ws.column_dimensions[column_letter].width = adjusted_width
             
-            # Save workbook
             wb.save(path)
             
             messagebox.showinfo("Export Successful", 
@@ -1092,22 +1535,19 @@ Module:        {MODULES[self.current_module_index][0]}
         try:
             wb = Workbook()
             
-            # Export scan results for all modules
             for module_name, _ in MODULES:
                 if not wb.sheetnames:
                     ws = wb.active
-                    ws.title = module_name[:31]  # Excel sheet name limit
+                    ws.title = module_name[:31]
                 else:
                     ws = wb.create_sheet(title=module_name[:31])
                 
-                # Headers
                 headers = ["Policy ID", "Policy Name", "Expected", "Current", "Status", "Timestamp"]
                 for col_num, header in enumerate(headers, 1):
                     cell = ws.cell(row=1, column=col_num, value=header)
                     cell.font = Font(bold=True)
                     cell.fill = PatternFill(start_color="FFE0E0E0", end_color="FFE0E0E0", fill_type="solid")
                 
-                # Data
                 cursor = self.conn.cursor()
                 cursor.execute("""
                     SELECT policy_id, policy_name, expected_value, current_value, status, scan_timestamp
@@ -1118,7 +1558,6 @@ Module:        {MODULES[self.current_module_index][0]}
                 rows = cursor.fetchall()
                 
                 for row_num, row in enumerate(rows, 2):
-                    # Convert sqlite3.Row to tuple
                     row_data = (
                         row['policy_id'],
                         row['policy_name'],
@@ -1131,7 +1570,6 @@ Module:        {MODULES[self.current_module_index][0]}
                     for col_num, value in enumerate(row_data, 1):
                         ws.cell(row=row_num, column=col_num, value=value)
             
-            # Remove default sheet if empty
             if len(wb.sheetnames) > 1 and wb["Sheet"].max_row == 1:
                 std = wb["Sheet"]
                 wb.remove(std)
@@ -1142,9 +1580,6 @@ Module:        {MODULES[self.current_module_index][0]}
         except Exception as e:
             messagebox.showerror("Export Failed", f"Failed to export all data:\n{e}")
 
-    # -------------------------
-    # Dashboard and Summary
-    # -------------------------
     def update_counts_from_db(self, rows):
         self.count_pass = sum(1 for r in rows if r[4] == "PASS")
         self.count_fail = sum(1 for r in rows if r[4] == "FAIL")
@@ -1173,48 +1608,39 @@ Module:        {MODULES[self.current_module_index][0]}
         else:
             self.compliance_var.set(f"Compliance: 0%")
         
-        # Generate report hash
         text = self.output_box.get(1.0, tk.END).encode("utf-8")
         h = hashlib.sha256(text).hexdigest().upper()[:16]
         self.hash_var.set(f"Report ID: {h}")
 
     def show_dashboard(self):
-        """Show a simple dashboard with statistics"""
         dashboard = tk.Toplevel(self.root)
         dashboard.title("Hardening Dashboard")
         dashboard.geometry("600x500")
         dashboard.configure(bg=BG_COLOR)
         
-        # Header
         header = tk.Frame(dashboard, bg=HEADER_COLOR, height=50)
         header.pack(fill=tk.X)
         tk.Label(header, text="HARDENING DASHBOARD", fg="white", bg=HEADER_COLOR,
                 font=("Segoe UI", 14, "bold")).pack(pady=10)
         
-        # Content
         content = tk.Frame(dashboard, bg=BG_COLOR, padx=20, pady=20)
         content.pack(fill=tk.BOTH, expand=True)
         
-        # Get overall statistics
         if self.conn:
             try:
                 cursor = self.conn.cursor()
                 
-                # Total policies
                 cursor.execute("SELECT COUNT(*) FROM scan_results")
                 total_policies = cursor.fetchone()[0]
                 
-                # Compliance percentage
                 cursor.execute("SELECT COUNT(*) FROM scan_results WHERE status='PASS'")
                 passed = cursor.fetchone()[0]
                 
                 compliance = int((passed / total_policies * 100)) if total_policies > 0 else 0
                 
-                # Module counts
                 cursor.execute("SELECT module_name, COUNT(*) FROM scan_results GROUP BY module_name")
                 module_counts = cursor.fetchall()
                 
-                # Display stats
                 stats_text = f"""
                 OVERALL STATISTICS
                 {"="*40}
@@ -1247,17 +1673,16 @@ Module:        {MODULES[self.current_module_index][0]}
                                   bg=BG_COLOR, fg=COLOR_FAIL)
             error_label.pack()
 
-    # -------------------------
-    # About Dialog
-    # -------------------------
     def show_about(self):
         about_text = f"""Enterprise Linux Hardening Tool v3.0
 
 Features:
-• 8 Hardening Modules with Rollback
+• 9 Hardening Modules with Rollback
 • Real-time Console Output
 • Progress Tracking
 • Excel Export (XLSX)
+• PDF Report Generation
+• Blockchain Tamper-Proofing
 • Search and Filter
 • Fix History Tracking
 • Compliance Dashboard
@@ -1269,9 +1694,6 @@ Created: {datetime.datetime.now().strftime('%Y-%m-%d')}
         """
         messagebox.showinfo("About", about_text)
 
-# -------------------------
-# Run Application
-# -------------------------
 def main():
     root = tk.Tk()
     app = HardeningApp(root)

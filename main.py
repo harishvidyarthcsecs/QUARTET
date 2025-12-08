@@ -7,16 +7,18 @@ import threading
 import datetime
 import hashlib
 import os
-import pandas as pd
+import platform
+import re
+
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
-import re
+from reportlab.platypus import PageBreak
 
 MODULES = [
     ("Access Control", "access_control.sh"),
@@ -94,6 +96,97 @@ class PDFReportGenerator:
     def __init__(self, db_conn):
         self.db = db_conn
     
+    def get_system_info(self):
+        try:
+            with open('/etc/os-release', 'r') as f:
+                os_info = {}
+                for line in f:
+                    if '=' in line:
+                        key, value = line.strip().split('=', 1)
+                        os_info[key] = value.strip('"')
+            
+            distribution = os_info.get('NAME', 'Unknown')
+            version = os_info.get('VERSION', 'Unknown')
+            
+            return {
+                'os_name': f"{distribution} {version}",
+                'architecture': platform.machine(),
+                'kernel': platform.release(),
+                'hostname': platform.node(),
+                'distribution_id': os_info.get('ID', 'Unknown').upper()
+            }
+        except:
+            return {
+                'os_name': platform.system(),
+                'architecture': platform.machine(),
+                'kernel': platform.release(),
+                'hostname': platform.node(),
+                'distribution_id': platform.system()
+            }
+    
+    def calculate_compliance_stats(self, module_name=None):
+        cursor = self.db.cursor()
+        
+        if module_name:
+            query = """
+                SELECT status, COUNT(*) as count 
+                FROM scan_results 
+                WHERE module_name=?
+                GROUP BY status
+            """
+            cursor.execute(query, (module_name,))
+        else:
+            query = """
+                SELECT status, COUNT(*) as count 
+                FROM scan_results 
+                GROUP BY status
+            """
+            cursor.execute(query)
+        
+        stats = cursor.fetchall()
+        
+        total = 0
+        passed = 0
+        failed = 0
+        manual = 0
+        warning = 0
+        
+        for stat in stats:
+            count = stat['count']
+            status = stat['status']
+            total += count
+            
+            if status == "PASS":
+                passed += count
+            elif status == "FAIL":
+                failed += count
+            elif status == "MANUAL":
+                manual += count
+            elif status in ["WARN", "WARNING"]:
+                warning += count
+        
+        if (passed + failed) > 0:
+            compliance_pct = (passed / (passed + failed)) * 100
+        else:
+            compliance_pct = 0
+        
+        if compliance_pct >= 90:
+            risk_level = "LOW"
+        elif compliance_pct >= 70:
+            risk_level = "MEDIUM"
+        else:
+            risk_level = "HIGH"
+        
+        return {
+            'total_rules': total,
+            'passed': passed,
+            'failed': failed,
+            'manual': manual,
+            'warnings': warning,
+            'compliance_pct': round(compliance_pct, 1),
+            'risk_level': risk_level
+        }
+    
     def generate_report(self, module_name=None, output_path=None):
         if output_path is None:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -102,7 +195,9 @@ class PDFReportGenerator:
             else:
                 output_path = f"hardening_report_all_{timestamp}.pdf"
         
-        doc = SimpleDocTemplate(output_path, pagesize=A4)
+        doc = SimpleDocTemplate(output_path, pagesize=A4,
+                               leftMargin=0.5*inch, rightMargin=0.5*inch,
+                               topMargin=0.5*inch, bottomMargin=0.5*inch)
         story = []
         
         styles = getSampleStyleSheet()
@@ -110,22 +205,109 @@ class PDFReportGenerator:
         title_style = ParagraphStyle(
             'CustomTitle',
             parent=styles['Heading1'],
-            fontSize=20,
+            fontSize=18,
             alignment=TA_CENTER,
-            spaceAfter=30,
+            spaceAfter=15,
             textColor=colors.HexColor('#1e88e5')
         )
         
-        story.append(Paragraph("Linux Hardening Compliance Report", title_style))
-        story.append(Spacer(1, 10))
+        section_style = ParagraphStyle(
+            'Section',
+            parent=styles['Heading3'],
+            fontSize=11,
+            spaceBefore=10,
+            spaceAfter=6,
+            textColor=colors.HexColor('#37474f'),
+            fontName='Helvetica-Bold'
+        )
         
-        meta_text = f"""
-        <b>Report Generated:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/>
-        <b>Module:</b> {module_name if module_name else 'All Modules'}<br/>
-        <b>Report ID:</b> {hashlib.md5(str(datetime.datetime.now()).encode()).hexdigest()[:16].upper()}
-        """
-        story.append(Paragraph(meta_text, styles["Normal"]))
-        story.append(Spacer(1, 20))
+        normal_small = ParagraphStyle(
+            'NormalSmall',
+            parent=styles['Normal'],
+            fontSize=8,
+            leading=10
+        )
+        
+        table_cell_style = ParagraphStyle(
+            'TableCell',
+            parent=styles['Normal'],
+            fontSize=8,
+            leading=9,
+            wordWrap='CJK'
+        )
+        
+        system_info = self.get_system_info()
+        stats = self.calculate_compliance_stats(module_name)
+        
+        story.append(Paragraph("Linux Hardening Compliance Report", title_style))
+        story.append(Spacer(1, 5))
+        
+        meta_data = [
+            ["Report Generated:", datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+            ["Operating System:", system_info['os_name']],
+            ["Architecture:", system_info['architecture']],
+            ["Kernel Version:", system_info['kernel']],
+            ["Distribution ID:", system_info['distribution_id']],
+            ["Module:", module_name if module_name else 'All Modules'],
+            ["Report ID:", f"HARDEN-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"]
+        ]
+        
+        meta_table_data = []
+        for label, value in meta_data:
+            meta_table_data.append([
+                Paragraph(f"<b>{label}</b>", table_cell_style),
+                Paragraph(value, table_cell_style)
+            ])
+        
+        meta_table = Table(meta_table_data, colWidths=[1.2*inch, 3.8*inch])
+        meta_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 2),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+        ]))
+        
+        story.append(meta_table)
+        story.append(Spacer(1, 15))
+        
+        story.append(Paragraph("Executive Summary", section_style))
+        
+        exec_data = [
+            ["Total Rules Scanned:", str(stats['total_rules'])],
+            ["Rules Passed:", str(stats['passed'])],
+            ["Rules Failed:", str(stats['failed'])],
+            ["Warnings:", str(stats['warnings'])],
+            ["Overall Compliance:", f"{stats['compliance_pct']}%"],
+            ["Risk Level:", f"<font color=\"{'#4caf50' if stats['risk_level'] == 'LOW' else '#ff9800' if stats['risk_level'] == 'MEDIUM' else '#f44336'}\">{stats['risk_level']}</font>"]
+        ]
+        
+        exec_table_data = []
+        for label, value in exec_data:
+            exec_table_data.append([
+                Paragraph(f"<b>{label}</b>", table_cell_style),
+                Paragraph(value, table_cell_style)
+            ])
+        
+        exec_table = Table(exec_table_data, colWidths=[1.5*inch, 1*inch])
+        exec_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+        ]))
+        
+        story.append(exec_table)
+        story.append(Spacer(1, 15))
+        
+        story.append(Paragraph("Detailed Results", section_style))
+        story.append(Spacer(1, 5))
         
         cursor = self.db.cursor()
         
@@ -146,91 +328,227 @@ class PDFReportGenerator:
         rows = cursor.fetchall()
         
         if not rows:
-            story.append(Paragraph("No scan results available.", styles["Normal"]))
+            story.append(Paragraph("No scan results available.", normal_small))
         else:
             if module_name:
-                data = [["ID", "Policy Name", "Expected", "Current", "Status"]]
+                table_data = []
+                
+                header_row = [
+                    Paragraph("<b>ID</b>", table_cell_style),
+                    Paragraph("<b>Policy Name</b>", table_cell_style),
+                    Paragraph("<b>Expected Value</b>", table_cell_style),
+                    Paragraph("<b>Current Value</b>", table_cell_style),
+                    Paragraph("<b>Status</b>", table_cell_style)
+                ]
+                table_data.append(header_row)
+                
                 for row in rows:
-                    data.append([
-                        row['policy_id'],
-                        row['policy_name'][:50],
-                        str(row['expected_value'])[:30],
-                        str(row['current_value'])[:30],
-                        row['status']
+                    policy_name = str(row['policy_name'])
+                    if len(policy_name) > 60:
+                        policy_name = policy_name[:57] + "..."
+                    
+                    expected = str(row['expected_value'] or "")
+                    if len(expected) > 30:
+                        expected = expected[:27] + "..."
+                    
+                    current = str(row['current_value'] or "")
+                    if len(current) > 30:
+                        current = current[:27] + "..."
+                    
+                    table_data.append([
+                        Paragraph(str(row['policy_id']), table_cell_style),
+                        Paragraph(policy_name, table_cell_style),
+                        Paragraph(expected, table_cell_style),
+                        Paragraph(current, table_cell_style),
+                        Paragraph(str(row['status']), table_cell_style)
                     ])
-                col_widths = [0.5*inch, 2.5*inch, 1.2*inch, 1.2*inch, 0.8*inch]
+                
+                col_widths = [0.4*inch, 2.5*inch, 1.2*inch, 1.2*inch, 0.6*inch]
+                
             else:
-                data = [["Module", "ID", "Policy Name", "Status"]]
+                table_data = []
+                
+                header_row = [
+                    Paragraph("<b>Module</b>", table_cell_style),
+                    Paragraph("<b>ID</b>", table_cell_style),
+                    Paragraph("<b>Policy Name</b>", table_cell_style),
+                    Paragraph("<b>Status</b>", table_cell_style),
+                    Paragraph("<b>Expected</b>", table_cell_style),
+                    Paragraph("<b>Current</b>", table_cell_style)
+                ]
+                table_data.append(header_row)
+                
                 for row in rows:
-                    data.append([
-                        row['module_name'],
-                        row['policy_id'],
-                        row['policy_name'][:40],
-                        row['status']
+                    module = str(row['module_name'])
+                    policy_name = str(row['policy_name'])
+                    if len(policy_name) > 40:
+                        policy_name = policy_name[:37] + "..."
+                    
+                    expected = str(row['expected_value'] or "")
+                    if len(expected) > 15:
+                        expected = expected[:12] + "..."
+                    
+                    current = str(row['current_value'] or "")
+                    if len(current) > 15:
+                        current = current[:12] + "..."
+                    
+                    table_data.append([
+                        Paragraph(module, table_cell_style),
+                        Paragraph(str(row['policy_id']), table_cell_style),
+                        Paragraph(policy_name, table_cell_style),
+                        Paragraph(str(row['status']), table_cell_style),
+                        Paragraph(expected, table_cell_style),
+                        Paragraph(current, table_cell_style)
                     ])
-                col_widths = [1*inch, 0.5*inch, 2.5*inch, 0.8*inch]
+                
+                col_widths = [0.7*inch, 0.4*inch, 2.2*inch, 0.6*inch, 0.8*inch, 0.8*inch]
             
-            table = Table(data, colWidths=col_widths)
+            table = Table(table_data, colWidths=col_widths, repeatRows=1)
             
             style = TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e88e5')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('FONTSIZE', (0, 0), (-1, 0), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+                ('TOPPADDING', (0, 0), (-1, 0), 6),
+                ('LEFTPADDING', (0, 0), (-1, -1), 4),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 1), (-1, -1), 3),
+                ('TOPPADDING', (0, 1), (-1, -1), 3),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f5f5f5')),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
             ])
             
-            for i in range(1, len(data)):
-                status = data[i][-1]
-                if status == "PASS":
-                    style.add('BACKGROUND', (-1, i), (-1, i), colors.lightgreen)
-                elif status == "FAIL":
-                    style.add('BACKGROUND', (-1, i), (-1, i), colors.pink)
-                elif status == "MANUAL":
-                    style.add('BACKGROUND', (-1, i), (-1, i), colors.lightyellow)
+            status_col_index = 4 if module_name else 3
+            
+            for i in range(1, len(table_data)):
+                status_cell = table_data[i][status_col_index]
+                status_text = status_cell.getPlainText() if hasattr(status_cell, 'getPlainText') else str(status_cell)
+                
+                if "PASS" in status_text:
+                    bg_color = colors.HexColor('#4caf50')
+                elif "FAIL" in status_text:
+                    bg_color = colors.HexColor('#f44336')
+                elif "MANUAL" in status_text:
+                    bg_color = colors.HexColor('#ff9800')
+                elif "WARN" in status_text or "WARNING" in status_text:
+                    bg_color = colors.HexColor('#ffc107')
+                else:
+                    bg_color = colors.HexColor('#9e9e9e')
+                
+                style.add('BACKGROUND', (status_col_index, i), (status_col_index, i), bg_color)
+                style.add('TEXTCOLOR', (status_col_index, i), (status_col_index, i), colors.white)
             
             table.setStyle(style)
             story.append(table)
-            story.append(Spacer(1, 20))
             
-            cursor.execute("""
-                SELECT status, COUNT(*) as count 
-                FROM scan_results 
-                WHERE module_name=? OR ? IS NULL
-                GROUP BY status
-            """, (module_name, module_name))
+            if len(rows) > 20:
+                story.append(PageBreak())
             
-            stats = cursor.fetchall()
+            story.append(Spacer(1, 10))
             
-            summary_text = "<b>Compliance Summary:</b><br/>"
-            for stat in stats:
-                summary_text += f"{stat['status']}: {stat['count']} policies<br/>"
+            story.append(Paragraph("Compliance Summary", section_style))
+            story.append(Spacer(1, 5))
             
-            story.append(Paragraph(summary_text, styles["Normal"]))
+            if module_name:
+                summary_data = [
+                    ["Status", "Count", "Percentage"],
+                    ["Passed", str(stats['passed']), f"{stats['compliance_pct']}%"],
+                    ["Failed", str(stats['failed']), f"{100 - stats['compliance_pct']}%"],
+                    ["Warnings", str(stats['warnings']), f"{(stats['warnings']/stats['total_rules']*100):.1f}%" if stats['total_rules'] > 0 else "0%"],
+                    ["Total", str(stats['total_rules']), "100%"]
+                ]
+            else:
+                cursor.execute("""
+                    SELECT module_name, 
+                           COUNT(*) as total,
+                           SUM(CASE WHEN status='PASS' THEN 1 ELSE 0 END) as passed,
+                           SUM(CASE WHEN status='FAIL' THEN 1 ELSE 0 END) as failed
+                    FROM scan_results 
+                    GROUP BY module_name
+                    ORDER BY module_name
+                """)
+                module_stats = cursor.fetchall()
+                
+                summary_data = [["Module", "Total", "Passed", "Failed", "Compliance"]]
+                for stat in module_stats:
+                    total = stat['total']
+                    passed = stat['passed'] or 0
+                    failed = stat['failed'] or 0
+                    compliance = (passed / total * 100) if total > 0 else 0
+                    
+                    summary_data.append([
+                        stat['module_name'],
+                        str(total),
+                        str(passed),
+                        str(failed),
+                        f"{compliance:.1f}%"
+                    ])
+                
+                summary_data.append([
+                    "TOTAL",
+                    str(stats['total_rules']),
+                    str(stats['passed']),
+                    str(stats['failed']),
+                    f"{stats['compliance_pct']}%"
+                ])
+            
+            summary_table_data = []
+            for i, row in enumerate(summary_data):
+                row_data = []
+                for j, cell in enumerate(row):
+                    if i == 0:
+                        row_data.append(Paragraph(f"<b>{cell}</b>", table_cell_style))
+                    else:
+                        row_data.append(Paragraph(str(cell), table_cell_style))
+                summary_table_data.append(row_data)
+            
+            summary_table = Table(summary_table_data, colWidths=[1.5*inch, 0.6*inch, 0.6*inch, 0.6*inch, 0.8*inch])
+            summary_style = TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#607d8b')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+                ('LEFTPADDING', (0, 0), (-1, -1), 4),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f5f5f5')),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+            ])
+            
+            if not module_name:
+                summary_style.add('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#e3f2fd'))
+                summary_style.add('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold')
+            
+            summary_table.setStyle(summary_style)
+            story.append(summary_table)
         
-        story.append(Spacer(1, 30))
-        story.append(Paragraph("="*50, styles["Normal"]))
+        story.append(Spacer(1, 15))
+        story.append(Paragraph("="*80, normal_small))
         
-        report_data = str(rows) + str(datetime.datetime.now())
+        report_data = str(rows) + str(datetime.datetime.now()) + str(stats)
         report_hash = hashlib.sha256(report_data.encode()).hexdigest()
         
         integrity_text = f"""
         <b>Integrity Verification:</b><br/>
-        <font size="8">Hash: {report_hash[:32]}...<br/>
-        Generated at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/>
+        <font size="7">Document Hash: {report_hash[:32]}...<br/>
+        Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/>
+        System: {system_info['hostname']}<br/>
         To verify: Compare this hash with stored hash in database.</font>
         """
-        story.append(Paragraph(integrity_text, styles["Normal"]))
+        story.append(Paragraph(integrity_text, normal_small))
         
         doc.build(story)
         
         self.store_report_hash(output_path, report_hash, module_name)
         
         return output_path, report_hash
-    
+        
     def store_report_hash(self, filename, report_hash, module_name):
         try:
             cursor = self.db.cursor()
@@ -1069,32 +1387,34 @@ Module:        {MODULES[self.current_module_index][0]}
             
             filename, report_hash = pdf_gen.generate_report(module_name)
             
+            report_id = f"HARDEN-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
             blockchain = SimpleBlockchainVerifier(self.conn)
             tx = blockchain.add_to_blockchain(
                 data=report_hash,
                 module_name=module_name or "ALL",
                 action_type="PDF_REPORT",
-                description=f"PDF report generated: {os.path.basename(filename)}"
+                description=f"PDF report generated: {os.path.basename(filename)} - ID: {report_id}"
             )
             
             self.hide_progress()
             
             if tx:
                 msg = f"✅ PDF Report Generated Successfully!\n\n"
+                msg += f"Report ID: {report_id}\n"
                 msg += f"File: {filename}\n"
                 msg += f"Blockchain TX: {tx['current_hash'][:16]}...\n"
                 msg += f"Timestamp: {tx['timestamp']}"
             else:
-                msg = f"✅ PDF Report Generated!\n\nFile: {filename}"
+                msg = f"✅ PDF Report Generated!\n\nReport ID: {report_id}\nFile: {filename}"
+            
+            self.hash_var.set(f"Report ID: {report_id}")
             
             if messagebox.askyesno("Report Generated", msg + "\n\nOpen PDF file?"):
                 if os.name == 'nt':
                     os.startfile(filename)
                 else:
                     os.system(f"xdg-open '{filename}'")
-            
-            short_hash = report_hash[:16].upper()
-            self.hash_var.set(f"Report ID: {short_hash} (PDF)")
         
         except Exception as e:
             self.hide_progress()

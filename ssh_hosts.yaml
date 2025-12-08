@@ -1,0 +1,27 @@
+hosts:
+- auth_type: key
+  hostname: 192.168.1.100
+  key_file: ~/.ssh/id_rsa
+  name: ubuntu-server
+  password: ''
+  port: 22
+  tags:
+  - linux
+  - ubuntu
+  - server
+  username: ubuntu
+- auth_type: password
+  hostname: 192.168.1.200
+  key_file: ''
+  name: windows-pc
+  password: YourPassword123
+  port: 22
+  tags:
+  - windows
+  - desktop
+  username: Administrator
+settings:
+  banner_timeout: 30
+  default_port: 22
+  default_username: root
+  timeout: 10
