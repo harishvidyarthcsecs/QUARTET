@@ -2269,6 +2269,7 @@ check_8_b_d_xx() {
 
     local current status
     local rules_file="/etc/audit/rules.d/hardening.rules"
+    local fixed=false
     
     # Check if immutable flag is set
     local has_immutable=$(grep -E "^\-e 2" "$rules_file" 2>/dev/null | wc -l)
@@ -2286,37 +2287,115 @@ check_8_b_d_xx() {
         log_error "Audit configuration is not immutable"
         
         if [[ "$MODE" == "fix" ]]; then
-            log_manual "=============================================="
-            log_manual "MANUAL CONFIGURATION: Audit Immutability"
-            log_manual "=============================================="
-            log_manual "Making audit config immutable requires system reboot."
-            log_manual ""
-            log_manual "WARNING: After adding -e 2, audit rules CANNOT be"
-            log_manual "modified until system reboot!"
-            log_manual ""
-            log_manual "To enable immutability:"
-            log_manual "1. Add to end of $rules_file:"
-            log_manual "   echo '-e 2' >> $rules_file"
-            log_manual ""
-            log_manual "2. Reload rules:"
-            log_manual "   sudo augenrules --load"
-            log_manual ""
-            log_manual "3. Verify after reboot:"
-            log_manual "   sudo auditctl -l | grep enabled"
-            log_manual ""
-            log_manual "This prevents runtime changes to audit configuration."
-            log_manual "=============================================="
-            current="Manual configuration required"
-            status="MANUAL"
-            ((MANUAL_CHECKS++))
+            log_info "Auto-fix: Making audit configuration immutable..."
+            
+            # Check if rules file exists, if not use default
+            if [ ! -f "$rules_file" ]; then
+                rules_file="/etc/audit/rules.d/audit.rules"
+                if [ ! -f "$rules_file" ]; then
+                    rules_file="/etc/audit/audit.rules"
+                fi
+            fi
+            
+            # Create directory if it doesn't exist
+            mkdir -p /etc/audit/rules.d/ 2>/dev/null
+            
+            # Check if -e 2 already exists
+            if [ "$has_immutable" -eq 0 ]; then
+                # Add -e 2 to the end of the rules file
+                echo "-e 2" | sudo tee -a "$rules_file" >/dev/null 2>&1
+                log_info "Added '-e 2' to $rules_file"
+            fi
+            
+            # Reload audit rules
+            if command -v augenrules >/dev/null 2>&1; then
+                sudo augenrules --load >/dev/null 2>&1
+                log_info "Reloaded audit rules using augenrules"
+            elif command -v auditctl >/dev/null 2>&1; then
+                sudo auditctl -R "$rules_file" >/dev/null 2>&1
+                log_info "Reloaded audit rules using auditctl"
+            fi
+            
+            # Give it a moment to load
+            sleep 2
+            
+            # Verify the fix
+            local new_has_immutable=$(grep -E "^\-e 2" "$rules_file" 2>/dev/null | wc -l)
+            local new_running=$(auditctl -l 2>/dev/null | grep -E "^enabled" | grep "2" | wc -l)
+            
+            if [ "$new_has_immutable" -gt 0 ] && [ "$new_running" -gt 0 ]; then
+                current="Immutable (via auto-fix)"
+                status="FIXED"
+                ((FAILED_CHECKS--))
+                ((FIXED_CHECKS++))
+                log_fixed "Audit configuration is now immutable"
+                fixed=true
+            else
+                # Check if it's in memory but needs reboot
+                local memory_check=$(auditctl -l 2>/dev/null | grep -E "^enabled")
+                if [[ "$memory_check" == *"2"* ]]; then
+                    current="Immutable in memory (requires reboot)"
+                    status="PASS"
+                    ((FAILED_CHECKS--))
+                    ((PASSED_CHECKS++))
+                    log_fixed "Audit configuration is immutable in memory"
+                    fixed=true
+                else
+                    log_warning "Immutable flag added but may require reboot to take effect"
+                    current="Manual configuration required (reboot needed)"
+                    status="MANUAL"
+                    ((MANUAL_CHECKS++))
+                fi
+            fi
         fi
     fi
 
-    print_check_result "$policy_id" "$policy_name" "$expected" "$current" "$status"
-    [[ "$MODE" == "scan" ]] && save_scan_result "$policy_id" "$policy_name" "$expected" "$current" "$status"
-    [[ "$MODE" == "fix" && "$status" == "MANUAL" ]] && save_fix_result "$policy_id" "$policy_name" "$expected" "Not immutable" "$current" "MANUAL"
-}
+    # Show manual instructions if not fixed and not in fix mode
+    if [[ "$status" == "FAIL" ]] && [[ "$MODE" != "fix" ]]; then
+        log_manual "=============================================="
+        log_manual "MANUAL CONFIGURATION: Audit Immutability"
+        log_manual "=============================================="
+        log_manual "To make audit config immutable:"
+        log_manual "1. Add to end of $rules_file:"
+        log_manual "   echo '-e 2' | sudo tee -a $rules_file"
+        log_manual ""
+        log_manual "2. Reload rules:"
+        log_manual "   sudo augenrules --load"
+        log_manual ""
+        log_manual "3. Verify:"
+        log_manual "   sudo auditctl -l | grep enabled"
+        log_manual ""
+        log_manual "Note: System reboot may be required for full effect."
+        log_manual "=============================================="
+    elif [[ "$status" == "MANUAL" ]] && [[ "$MODE" == "fix" ]]; then
+        log_manual "=============================================="
+        log_manual "IMMEDIATE ACTION REQUIRED: Audit Immutability"
+        log_manual "=============================================="
+        log_manual "Immutable flag added but may require reboot."
+        log_manual ""
+        log_manual "Current status:"
+        log_manual "   On-disk: $(grep -E "^\-e 2" "$rules_file" 2>/dev/null && echo "Present" || echo "Missing")"
+        log_manual "   In-memory: $(auditctl -l 2>/dev/null | grep -E "^enabled" || echo "Not active")"
+        log_manual ""
+        log_manual "To complete:"
+        log_manual "   sudo reboot"
+        log_manual "=============================================="
+    fi
 
+    print_check_result "$policy_id" "$policy_name" "$expected" "$current" "$status"
+    
+    if [[ "$MODE" == "scan" ]]; then
+        save_scan_result "$policy_id" "$policy_name" "$expected" "$current" "$status"
+    fi
+    
+    if [[ "$MODE" == "fix" ]]; then
+        if [[ "$fixed" == true ]]; then
+            save_fix_result "$policy_id" "$policy_name" "$expected" "Not immutable" "$current" "FIXED"
+        elif [[ "$status" == "MANUAL" ]]; then
+            save_fix_result "$policy_id" "$policy_name" "$expected" "Not immutable" "$current" "MANUAL"
+        fi
+    fi
+}
 check_8_b_d_xxi() {
     local policy_id="8.b.d.xxi"
     local policy_name="Ensure the running and on disk configuration is the same"

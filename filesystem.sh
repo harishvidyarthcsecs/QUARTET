@@ -18,6 +18,8 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
 NC='\033[0m'
 
 # Counters
@@ -31,10 +33,12 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
 log_pass()  { echo -e "${GREEN}[PASS]${NC} $1"; }
-log_manual() { echo -e "${BLUE}[FIXED]${NC} $1"; }
+log_manual() { echo -e "${CYAN}[MANUAL]${NC} $1"; }
 
 # Track if fstab was modified
 FSTAB_MODIFIED=false
+FSTAB_BACKUP=""
+
 # Initialize Database
 init_database() {
     python3 -c "
@@ -101,6 +105,7 @@ print_check_result() {
         FAIL) status_colored="${RED}$status${NC}" ;;
         FIXED) status_colored="${BLUE}$status${NC}" ;;
         WARN) status_colored="${YELLOW}$status${NC}" ;;
+        MANUAL) status_colored="${CYAN}$status${NC}" ;;
     esac
     
     echo "=============================================="
@@ -207,57 +212,129 @@ except Exception as e:
 " 2>/dev/null
 }
 
-# Check if directory is on root filesystem
-is_on_root_filesystem() {
+# ============================================================================
+# NEW: IMPROVED PARTITION CHECKING LOGIC
+# ============================================================================
+
+# Check if directory is on separate partition
+is_on_separate_partition() {
+    local dir="$1"
+    
+    # Check if directory exists
+    if [ ! -d "$dir" ]; then
+        echo "DIR_NOT_EXIST"
+        return 1
+    fi
+    
+    # Get mount point for this directory
+    local dir_mount
+    dir_mount=$(df -P "$dir" 2>/dev/null | awk 'NR==2 {print $6}')
+    
+    # Get root mount point
+    local root_mount
+    root_mount=$(df -P / 2>/dev/null | awk 'NR==2 {print $6}')
+    
+    # If directory mount point equals the directory itself, it's a mount point
+    if [ "$dir_mount" = "$dir" ]; then
+        echo "SEPARATE"
+        return 0
+    # If directory is mounted at root, it's not separate
+    elif [ "$dir_mount" = "/" ] && [ "$dir" != "/" ]; then
+        echo "ON_ROOT"
+        return 1
+    # If mounted somewhere else
+    elif [ -n "$dir_mount" ] && [ "$dir_mount" != "/" ]; then
+        echo "SEPARATE"
+        return 0
+    else
+        echo "UNKNOWN"
+        return 1
+    fi
+}
+
+# Get detailed partition info
+get_partition_info() {
     local dir="$1"
     
     if [ ! -d "$dir" ]; then
-        return 2
+        echo "Directory does not exist"
+        return
     fi
     
-    local dir_device
-    local root_device
-    dir_device=$(df "$dir" 2>/dev/null | tail -1 | awk '{print $1}')
-    root_device=$(df / 2>/dev/null | tail -1 | awk '{print $1}')
+    local device
+    local fstype
+    local mount_point
+    local options
     
-    if [ -z "$dir_device" ] || [ -z "$root_device" ]; then
-        return 2
+    # Use findmnt for more reliable info
+    if command -v findmnt &> /dev/null; then
+        device=$(findmnt -n -o SOURCE "$dir" 2>/dev/null)
+        fstype=$(findmnt -n -o FSTYPE "$dir" 2>/dev/null)
+        mount_point=$(findmnt -n -o TARGET "$dir" 2>/dev/null)
+        options=$(findmnt -n -o OPTIONS "$dir" 2>/dev/null)
+    else
+        # Fallback to df and mount
+        device=$(df -P "$dir" 2>/dev/null | awk 'NR==2 {print $1}')
+        fstype=$(df -PT "$dir" 2>/dev/null | awk 'NR==2 {print $2}')
+        mount_point=$(df -P "$dir" 2>/dev/null | awk 'NR==2 {print $6}')
+        options=$(mount | grep " on $mount_point " | sed 's/.*(\(.*\))/\1/' 2>/dev/null)
     fi
     
-    if [ "$dir_device" = "$root_device" ]; then
+    echo "Device: $device"
+    echo "Filesystem: $fstype"
+    echo "Mount point: $mount_point"
+    echo "Options: $options"
+}
+
+# Check if partition has entry in fstab
+has_fstab_entry() {
+    local mount_point="$1"
+    
+    if [ ! -f "/etc/fstab" ]; then
+        return 1
+    fi
+    
+    # Check for exact mount point
+    if grep -q "^[^#].*[[:space:]]${mount_point}[[:space:]]" /etc/fstab; then
+        return 0
+    fi
+    
+    # Check with escaped slashes for findmnt-like entries
+    local escaped_mount=$(echo "$mount_point" | sed 's/\//\\\//g')
+    if grep -q "^[^#].*[[:space:]]${mount_point}[[:space:]]" /etc/fstab; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Get fstab entry
+get_fstab_entry() {
+    local mount_point="$1"
+    grep "^[^#].*[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null | head -1
+}
+
+# Check if mount option is set
+has_mount_option() {
+    local mount_point="$1"
+    local option="$2"
+    
+    local options
+    if command -v findmnt &> /dev/null; then
+        options=$(findmnt -n -o OPTIONS "$mount_point" 2>/dev/null)
+    else
+        options=$(mount | grep " on $mount_point " | sed 's/.*(\(.*\))/\1/' 2>/dev/null)
+    fi
+    
+    if [[ ",$options," == *",$option,"* ]] || [[ "$options" == *"$option"* ]]; then
         return 0
     else
         return 1
     fi
 }
 
-# Check if directory exists in fstab
-fstab_has_entry() {
-    local partition="$1"
-    grep -q "^[^#]*[[:space:]]$partition[[:space:]]" /etc/fstab 2>/dev/null
-}
-
-# Get current mount options
-get_mount_options() {
-    local partition="$1"
-    mount | grep " on $partition " | sed 's/.*(\(.*\))/\1/' 2>/dev/null
-}
-
-# Check if mount has specific option
-has_mount_option() {
-    local options_list="$1"
-    local option="$2"
-    echo "$options_list" | grep -qw "$option"
-}
-
-# Check if partition is mounted
-is_mounted() {
-    local partition="$1"
-    mount | grep -q " on $partition " 2>/dev/null
-}
-
 # ============================================================================
-# 1.1 Filesystem Kernel Modules
+# 1.1 Filesystem Kernel Modules (Keep as is)
 # ============================================================================
 
 check_kernel_module() {
@@ -368,7 +445,7 @@ check_all_kernel_modules() {
 }
 
 # ============================================================================
-# Partition Checks
+# NEW: IMPROVED PARTITION CHECKS
 # ============================================================================
 
 check_partition_exists() {
@@ -379,40 +456,108 @@ check_partition_exists() {
     
     ((TOTAL_CHECKS++))
     
-    if [ ! -d "$partition" ]; then
-        if [ "$MODE" = "scan" ]; then
-            local current="Directory does not exist"
-            print_check_result "$policy_id" "$rule_name" "$expected" "$current" "FAIL"
-            save_scan_result "$policy_id" "$rule_name" "$expected" "$current" "FAIL"
-            ((FAILED_CHECKS++))
-        fi
-        return 2
-    fi
-    
-    if [ "$MODE" = "scan" ] || [ "$MODE" = "fix" ]; then
+    if [ "$MODE" = "scan" ]; then
+        local result
+        result=$(is_on_separate_partition "$partition")
         local status="FAIL"
-        local current="On root filesystem"
+        local current=""
         
-        if is_mounted "$partition"; then
-            if is_on_root_filesystem "$partition"; then
-                current="On root filesystem (not separate)"
-            else
+        case "$result" in
+            "SEPARATE")
                 status="PASS"
                 current="Separate partition"
                 ((PASSED_CHECKS++))
+                ;;
+            "ON_ROOT")
+                current="Mounted as part of root filesystem"
+                ((FAILED_CHECKS++))
+                ;;
+            "DIR_NOT_EXIST")
+                current="Directory does not exist"
+                ((FAILED_CHECKS++))
+                ;;
+            *)
+                current="Unknown status"
+                ((FAILED_CHECKS++))
+                ;;
+        esac
+        
+        # Get additional info for display
+        if [ "$partition" != "/" ] && [ -d "$partition" ]; then
+            local mount_info
+            mount_info=$(df -h "$partition" 2>/dev/null | awk 'NR==2 {print "Size:",$2,"Used:",$3,"Avail:",$4,"Use%:",$5,"Mounted:",$6}')
+            if [ -n "$mount_info" ]; then
+                current="$current ($mount_info)"
             fi
-        else
-            current="Not mounted"
         fi
         
-        if [ "$status" = "FAIL" ]; then
-            ((FAILED_CHECKS++))
+        print_check_result "$policy_id" "$rule_name" "$expected" "$current" "$status"
+        save_scan_result "$policy_id" "$rule_name" "$expected" "$current" "$status"
+        
+    elif [ "$MODE" = "fix" ]; then
+        # Check current state
+        local result
+        result=$(is_on_separate_partition "$partition")
+        
+        if [ "$result" = "SEPARATE" ]; then
+            log_pass "$partition is already a separate partition"
+            return 0
         fi
         
-        if [ "$MODE" = "scan" ]; then
-            print_check_result "$policy_id" "$rule_name" "$expected" "$current" "$status"
-            save_scan_result "$policy_id" "$rule_name" "$expected" "$current" "$status"
+        # Get original state from scan
+        local scan_data
+        scan_data=$(get_scan_result "$policy_id")
+        local original_value=$(echo "$scan_data" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('current_value', ''))")
+        
+        if [ -z "$original_value" ]; then
+            original_value="$result"
         fi
+        
+        # Display manual instructions for creating separate partition
+        echo ""
+        echo -e "${CYAN}=======================================================================${NC}"
+        echo -e "${YELLOW}MANUAL ACTION REQUIRED:${NC} Create separate partition for $partition"
+        echo -e "${CYAN}=======================================================================${NC}"
+        echo ""
+        echo -e "${GREEN}Steps to create separate partition:${NC}"
+        echo "1. Check available disk space:"
+        echo "   # fdisk -l"
+        echo "   # lsblk"
+        echo ""
+        echo "2. Create new partition using one of:"
+        echo "   # fdisk /dev/sdX"
+        echo "   # parted /dev/sdX"
+        echo "   # gdisk /dev/sdX (for GPT)"
+        echo ""
+        echo "3. Create filesystem on new partition:"
+        echo "   # mkfs.ext4 /dev/sdXN"
+        echo ""
+        echo "4. Create mount point if needed:"
+        echo "   # mkdir -p $partition"
+        echo ""
+        echo "5. Move existing data (if any):"
+        echo "   # cp -ax $partition/* /mnt/temp/"
+        echo ""
+        echo "6. Add entry to /etc/fstab:"
+        echo "   /dev/sdXN  $partition  ext4  defaults  0 0"
+        echo ""
+        echo "7. Mount the new partition:"
+        echo "   # mount -a"
+        echo ""
+        echo -e "${YELLOW}Note:${NC} These steps require manual intervention and careful planning."
+        echo -e "${YELLOW}Warning:${NC} Partitioning can lead to data loss if done incorrectly!"
+        echo ""
+        
+        # Update status to indicate manual action required
+        local current_value="MANUAL ACTION REQUIRED"
+        local status="MANUAL"
+        
+        print_check_result "$policy_id" "$rule_name" "$expected" "$current_value" "$status"
+        save_fix_result "$policy_id" "$rule_name" "$expected" "$original_value" "$current_value" "$status"
+        ((MANUAL_CHECKS++))
+        
+    elif [ "$MODE" = "rollback" ]; then
+        log_info "Checking rollback for $partition partition existence..."
     fi
 }
 
@@ -425,59 +570,70 @@ check_partition_option() {
     
     ((TOTAL_CHECKS++))
     
-    if [ ! -d "$partition" ] && [ "$partition" != "/dev/shm" ]; then
-        if [ "$MODE" = "scan" ]; then
-            local current="Directory does not exist"
-            print_check_result "$policy_id" "$rule_name" "$expected" "$current" "FAIL"
-            save_scan_result "$policy_id" "$rule_name" "$expected" "$current" "FAIL"
-            ((FAILED_CHECKS++))
-        fi
-        return 2
-    fi
-    
     if [ "$MODE" = "scan" ]; then
         local status="FAIL"
-        local current="Not set"
+        local current=""
         
-        if ! is_mounted "$partition"; then
-            current="Not mounted"
-        else
-            local current_options
-            current_options=$(get_mount_options "$partition")
-            
-            if has_mount_option "$current_options" "$option"; then
-                status="PASS"
-                current="$option"
-                ((PASSED_CHECKS++))
-            else
-                current="Option not set (current: $current_options)"
-            fi
-        fi
-        
-        if [ "$status" = "FAIL" ]; then
+        # Check if directory exists
+        if [ ! -d "$partition" ] && [ "$partition" != "/dev/shm" ]; then
+            current="Directory does not exist"
             ((FAILED_CHECKS++))
+        else
+            # First check if it's a separate partition
+            local partition_status
+            partition_status=$(is_on_separate_partition "$partition")
+            
+            if [ "$partition_status" != "SEPARATE" ]; then
+                current="Not a separate partition"
+                ((FAILED_CHECKS++))
+            else
+                # Check mount option
+                if has_mount_option "$partition" "$option"; then
+                    status="PASS"
+                    current="$option option is set"
+                    ((PASSED_CHECKS++))
+                else
+                    current="$option option is NOT set"
+                    ((FAILED_CHECKS++))
+                    
+                    # Get current options
+                    local current_opts
+                    if command -v findmnt &> /dev/null; then
+                        current_opts=$(findmnt -n -o OPTIONS "$partition" 2>/dev/null)
+                    else
+                        current_opts=$(mount | grep " on $partition " | sed 's/.*(\(.*\))/\1/' 2>/dev/null)
+                    fi
+                    
+                    if [ -n "$current_opts" ]; then
+                        current="$current (current options: $current_opts)"
+                    fi
+                fi
+            fi
         fi
         
         print_check_result "$policy_id" "$rule_name" "$expected" "$current" "$status"
         save_scan_result "$policy_id" "$rule_name" "$expected" "$current" "$status"
         
     elif [ "$MODE" = "fix" ]; then
-        if ! is_mounted "$partition"; then
-            log_error "Cannot fix: $partition is not mounted"
+        # Check if directory exists
+        if [ ! -d "$partition" ] && [ "$partition" != "/dev/shm" ]; then
+            log_error "Directory $partition does not exist"
             return 1
         fi
         
-        if ! fstab_has_entry "$partition"; then
-            log_error "Cannot fix: No fstab entry found for $partition"
+        # Check if it's a separate partition
+        local partition_status
+        partition_status=$(is_on_separate_partition "$partition")
+        
+        if [ "$partition_status" != "SEPARATE" ]; then
+            log_error "Cannot set mount options: $partition is not a separate partition"
             ((MANUAL_CHECKS++))
             return 1
         fi
         
-        local current_options
-        current_options=$(get_mount_options "$partition")
-        
-        if has_mount_option "$current_options" "$option"; then
-            log_pass "$partition already has $option option set"
+        # Check if already has the option
+        if has_mount_option "$partition" "$option"; then
+            log_pass "$partition already has $option option"
             return 0
         fi
         
@@ -487,47 +643,123 @@ check_partition_option() {
         local original_value=$(echo "$scan_data" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('current_value', ''))")
         
         if [ -z "$original_value" ]; then
-            original_value="Option not set (current: $current_options)"
+            # Get current options
+            local current_opts
+            if command -v findmnt &> /dev/null; then
+                current_opts=$(findmnt -n -o OPTIONS "$partition" 2>/dev/null)
+            else
+                current_opts=$(mount | grep " on $partition " | sed 's/.*(\(.*\))/\1/' 2>/dev/null)
+            fi
+            original_value="$option option is NOT set (current: $current_opts)"
         fi
         
-        # Backup fstab
-        cp /etc/fstab "$BACKUP_DIR/fstab.$(date +%Y%m%d_%H%M%S)"
+        # Check if partition has entry in fstab
+        if ! has_fstab_entry "$partition"; then
+            echo ""
+            echo -e "${CYAN}=======================================================================${NC}"
+            echo -e "${YELLOW}MANUAL ACTION REQUIRED:${NC} No fstab entry found for $partition"
+            echo -e "${CYAN}=======================================================================${NC}"
+            echo ""
+            echo -e "${GREEN}To add mount options:${NC}"
+            echo "1. Check current mount:"
+            echo "   # mount | grep '$partition'"
+            echo ""
+            echo "2. Add entry to /etc/fstab. Example:"
+            echo "   /dev/sdXN  $partition  ext4  defaults,$option  0 0"
+            echo ""
+            echo "3. Apply changes:"
+            echo "   # mount -o remount $partition"
+            echo ""
+            
+            local current_value="MANUAL ACTION REQUIRED - No fstab entry"
+            local status="MANUAL"
+            
+            print_check_result "$policy_id" "$rule_name" "$expected" "$current_value" "$status"
+            save_fix_result "$policy_id" "$rule_name" "$expected" "$original_value" "$current_value" "$status"
+            ((MANUAL_CHECKS++))
+            return 1
+        fi
         
-        # Save original fstab line
-        local original_fstab_line
-        original_fstab_line=$(grep "^[^#]*[[:space:]]$partition[[:space:]]" /etc/fstab)
+        # Backup fstab before modification
+        if [ -z "$FSTAB_BACKUP" ]; then
+            FSTAB_BACKUP="$BACKUP_DIR/fstab.backup.$(date +%Y%m%d_%H%M%S)"
+            cp /etc/fstab "$FSTAB_BACKUP"
+            log_info "Backed up fstab to: $FSTAB_BACKUP"
+        fi
         
+        # Update fstab entry
         local temp_file
         temp_file=$(mktemp)
-        awk -v partition="$partition" -v opt="$option" '
-        $2 == partition {
-            if ($4 == "defaults") {
-                $4 = "defaults," opt
-            } else if ($4 !~ opt) {
-                $4 = $4 "," opt
-            }
-        }
-        { print }
-        ' /etc/fstab > "$temp_file" && mv "$temp_file" /etc/fstab
+        local updated=false
         
-        if [ $? -eq 0 ]; then
-            log_info "Added $option to $partition in fstab"
-            FSTAB_MODIFIED=true
-            
-            local current_value="$option"
-            local status="PASS"
-            
-            save_fix_result "$policy_id" "$rule_name" "$expected" "$original_value" "$current_value" "$status"
-            ((FIXED_CHECKS++))
+        while IFS= read -r line; do
+            # Check if this is the partition line
+            if echo "$line" | grep -q "^[^#].*[[:space:]]${partition}[[:space:]]"; then
+                # Parse the line
+                local device=$(echo "$line" | awk '{print $1}')
+                local mp=$(echo "$line" | awk '{print $2}')
+                local fstype=$(echo "$line" | awk '{print $3}')
+                local opts=$(echo "$line" | awk '{print $4}')
+                local dump=$(echo "$line" | awk '{print $5}')
+                local pass=$(echo "$line" | awk '{print $6}')
+                
+                # Update options
+                if [[ ",$opts," != *",$option,"* ]]; then
+                    if [ "$opts" = "defaults" ]; then
+                        opts="defaults,$option"
+                    else
+                        opts="$opts,$option"
+                    fi
+                    updated=true
+                    FSTAB_MODIFIED=true
+                fi
+                
+                # Write updated line
+                printf "%-20s %-15s %-10s %-30s %s %s\n" "$device" "$mp" "$fstype" "$opts" "$dump" "$pass" >> "$temp_file"
+            else
+                # Write unchanged line
+                echo "$line" >> "$temp_file"
+            fi
+        done < /etc/fstab
+        
+        if [ "$updated" = true ]; then
+            # Replace fstab
+            if mv "$temp_file" /etc/fstab; then
+                chmod 644 /etc/fstab
+                log_info "Updated fstab for $partition with $option option"
+                
+                # Try to remount
+                if mount -o remount "$partition" 2>/dev/null; then
+                    log_pass "Successfully remounted $partition with $option option"
+                    local current_value="$option option has been set"
+                    local status="PASS"
+                else
+                    log_warn "Updated fstab but could not remount $partition"
+                    log_warn "Run 'mount -o remount $partition' manually or reboot"
+                    local current_value="$option option added to fstab (remount required)"
+                    local status="WARN"
+                fi
+                
+                save_fix_result "$policy_id" "$rule_name" "$expected" "$original_value" "$current_value" "$status"
+                ((FIXED_CHECKS++))
+            else
+                log_error "Failed to update /etc/fstab"
+                return 1
+            fi
+        else
+            log_info "$partition already has $option option in fstab"
+            rm -f "$temp_file"
         fi
         
     elif [ "$MODE" = "rollback" ]; then
-        log_info "Checking rollback for $partition $option..."
-        # Rollback logic will be handled by generate_rollback_script
+        log_info "Checking rollback for $partition $option option..."
     fi
 }
 
-# Configure /tmp
+# ============================================================================
+# Partition Configuration Functions
+# ============================================================================
+
 check_tmp_partition() {
     log_info "=== 1.b Configure /tmp ==="
     check_partition_exists "/tmp" "FS-1.b.i"
@@ -536,7 +768,6 @@ check_tmp_partition() {
     check_partition_option "/tmp" "noexec" "FS-1.b.iv"
 }
 
-# Configure /dev/shm
 check_dev_shm_partition() {
     log_info "=== 1.c Configure /dev/shm ==="
     check_partition_exists "/dev/shm" "FS-1.c.i"
@@ -545,7 +776,6 @@ check_dev_shm_partition() {
     check_partition_option "/dev/shm" "noexec" "FS-1.c.iv"
 }
 
-# Configure /home
 check_home_partition() {
     log_info "=== 1.d Configure /home ==="
     check_partition_exists "/home" "FS-1.d.i"
@@ -553,7 +783,6 @@ check_home_partition() {
     check_partition_option "/home" "nosuid" "FS-1.d.iii"
 }
 
-# Configure /var
 check_var_partition() {
     log_info "=== 1.e Configure /var ==="
     check_partition_exists "/var" "FS-1.e.i"
@@ -561,7 +790,6 @@ check_var_partition() {
     check_partition_option "/var" "nosuid" "FS-1.e.iii"
 }
 
-# Configure /var/tmp
 check_var_tmp_partition() {
     log_info "=== 1.f Configure /var/tmp ==="
     check_partition_exists "/var/tmp" "FS-1.f.i"
@@ -570,7 +798,6 @@ check_var_tmp_partition() {
     check_partition_option "/var/tmp" "noexec" "FS-1.f.iv"
 }
 
-# Configure /var/log
 check_var_log_partition() {
     log_info "=== 1.g Configure /var/log ==="
     check_partition_exists "/var/log" "FS-1.g.i"
@@ -579,13 +806,12 @@ check_var_log_partition() {
     check_partition_option "/var/log" "noexec" "FS-1.g.iv"
 }
 
-# Configure /var/log/audit
 check_var_log_audit_partition() {
     log_info "=== 1.h Configure /var/log/audit ==="
-    check_partition_exists "/var/log/audit" "FS-1.h"
-    check_partition_option "/var/log/audit" "nodev" "FS-1.h.i"
-    check_partition_option "/var/log/audit" "nosuid" "FS-1.h.ii"
-    check_partition_option "/var/log/audit" "noexec" "FS-1.h.iii"
+    check_partition_exists "/var/log/audit" "FS-1.h.i"
+    check_partition_option "/var/log/audit" "nodev" "FS-1.h.ii"
+    check_partition_option "/var/log/audit" "nosuid" "FS-1.h.iii"
+    check_partition_option "/var/log/audit" "noexec" "FS-1.h.iv"
 }
 
 # ============================================================================
@@ -627,7 +853,7 @@ try:
     # Generate rollback script
     script_content = '''#!/bin/bash
 # Auto-generated Rollback Script for Filesystem Module
-# Generated at: $(date)
+# Generated at: ''' + os.popen('date').read().strip() + '''
 
 BACKUP_DIR="''' + BACKUP_DIR + '''"
 MODULE="''' + MODULE_NAME + '''"
@@ -645,32 +871,46 @@ echo "========================================================================"
         if 'kernel module' in policy_name.lower():
             module_name = policy_name.split()[1]
             if 'not available' in policy_name:
-                if 'Blacklisted: No' in original_value or 'Blacklisted: Yes' not in original_value:
-                    script_content += f'''
+                script_content += f'''
 # Rollback: {policy_name}
-echo "Rolling back {module_name} module..."
+echo "Rolling back {module_name} module configuration..."
 if [ -f "/etc/modprobe.d/{module_name}-blacklist.conf" ]; then
-    rm -f "/etc/modprobe.d/{module_name}-blacklist.conf"
-    echo "Removed blacklist for {module_name}"
+    # Check if we have a backup
+    LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/{module_name}-blacklist.conf.bak.* 2>/dev/null | head -1)
+    if [ -n "$LATEST_BACKUP" ]; then
+        cp "$LATEST_BACKUP" "/etc/modprobe.d/{module_name}-blacklist.conf"
+        echo "Restored {module_name} config from backup"
+    else
+        rm -f "/etc/modprobe.d/{module_name}-blacklist.conf"
+        echo "Removed {module_name} blacklist (no backup found)"
+    fi
 fi
+modprobe {module_name} 2>/dev/null && echo "Loaded {module_name} module" || echo "Note: Could not load {module_name} module"
 
 '''
         
         # Partition options rollback
         elif 'option set on' in policy_name.lower():
-            partition = policy_name.split('on')[1].split('partition')[0].strip()
-            option = policy_name.split('Ensure')[1].split('option')[0].strip()
+            # Extract partition from policy name
+            parts = policy_name.split()
+            for i, part in enumerate(parts):
+                if part == 'on':
+                    partition = parts[i + 1]
+                    break
             
-            if 'not set' in original_value.lower() or 'FAIL' in scan_status:
-                script_content += f'''
+            script_content += f'''
 # Rollback: {policy_name}
-echo "Rolling back {option} option on {partition}..."
-LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/fstab.* 2>/dev/null | head -1)
+echo "Rolling back mount options for {partition}..."
+LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/fstab.backup.* 2>/dev/null | head -1)
 if [ -n "$LATEST_BACKUP" ]; then
     cp "$LATEST_BACKUP" /etc/fstab
     echo "Restored fstab from backup"
-    mount -o remount {partition} 2>/dev/null
-    echo "Remounted {partition}"
+    if mount | grep -q " on {partition} "; then
+        mount -o remount {partition} 2>/dev/null
+        echo "Remounted {partition} with original options"
+    fi
+else:
+    echo "Warning: No fstab backup found for {partition}"
 fi
 
 '''
@@ -750,20 +990,39 @@ main() {
             # Generate rollback script after fixes
             generate_rollback_script
             
+            # Apply fstab changes if modified
             if [ "$FSTAB_MODIFIED" = "true" ]; then
                 echo ""
                 log_info "Applying fstab changes..."
                 
+                # Test fstab syntax
                 if mount -a --test 2>/dev/null; then
                     log_info "fstab syntax is valid"
                     
+                    # Remount partitions with new options
+                    local mount_success=true
                     for part in /var/log/audit /var/log /var/tmp /var /home /tmp /dev/shm; do
-                        if is_mounted "$part" && fstab_has_entry "$part"; then
+                        if mount | grep -q " on $part " 2>/dev/null; then
                             if mount -o remount "$part" 2>/dev/null; then
                                 log_pass "Remounted $part with new options"
+                            else
+                                log_warn "Could not remount $part (might require reboot)"
+                                mount_success=false
                             fi
                         fi
                     done
+                    
+                    if [ "$mount_success" = "false" ]; then
+                        log_warn "Some partitions could not be remounted"
+                        log_warn "Run 'mount -o remount /partition' manually or reboot"
+                    fi
+                else
+                    log_error "fstab has syntax errors!"
+                    log_info "Restoring from backup..."
+                    if [ -n "$FSTAB_BACKUP" ] && [ -f "$FSTAB_BACKUP" ]; then
+                        cp "$FSTAB_BACKUP" /etc/fstab
+                        log_info "Restored fstab from backup"
+                    fi
                 fi
             fi
         fi
@@ -786,6 +1045,12 @@ main() {
         else
             echo "Fixed: $FIXED_CHECKS"
             echo "Manual Actions Required: $MANUAL_CHECKS"
+            
+            if [ $MANUAL_CHECKS -gt 0 ]; then
+                echo ""
+                log_manual "$MANUAL_CHECKS checks require manual intervention"
+                log_manual "Please follow the instructions shown above"
+            fi
             
             if [ $FIXED_CHECKS -gt 0 ]; then
                 echo ""
