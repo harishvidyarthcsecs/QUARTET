@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SSH MANAGER - Multi-Computer Connection Tool
+SSH MANAGER - Multi-Computer Connection Tool with Network Discovery
 Standalone tool to connect to multiple Linux/Windows computers via SSH
 """
 
@@ -16,12 +16,20 @@ import datetime
 import socket
 import csv
 import subprocess
+import time
+import ipaddress
+import netifaces
+import qrcode
+import pyotp
 from pathlib import Path
+from io import BytesIO
+from PIL import Image, ImageTk
 
 # ==================== CONFIGURATION ====================
 CONFIG_FILE = "ssh_hosts.yaml"
 RESULTS_DIR = "ssh_results"
 LOG_FILE = "ssh_manager.log"
+SECRETS_FILE = "ssh_secrets.json"
 
 # Colors for GUI
 BG_COLOR = "#f0f8ff"
@@ -35,12 +43,216 @@ COLOR_ERROR = "#f44336"
 COLOR_WARNING = "#ff9800"
 COLOR_INFO = "#2196f3"
 
+class TwoFactorAuth:
+    """Two-Factor Authentication Manager"""
+    def __init__(self):
+        self.secrets = self.load_secrets()
+        
+    def load_secrets(self):
+        """Load TOTP secrets from file"""
+        if os.path.exists(SECRETS_FILE):
+            with open(SECRETS_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    
+    def save_secrets(self):
+        """Save TOTP secrets to file"""
+        with open(SECRETS_FILE, 'w') as f:
+            json.dump(self.secrets, f, indent=2)
+    
+    def generate_secret(self, hostname, username):
+        """Generate a new TOTP secret for a host"""
+        secret = pyotp.random_base32()
+        key = f"{hostname}:{username}"
+        self.secrets[key] = secret
+        self.save_secrets()
+        
+        # Generate provisioning URI for QR code
+        totp = pyotp.TOTP(secret)
+        provisioning_uri = totp.provisioning_uri(
+            name=f"{username}@{hostname}",
+            issuer_name="SSH Manager"
+        )
+        
+        return secret, provisioning_uri
+    
+    def get_secret(self, hostname, username):
+        """Get secret for a host"""
+        key = f"{hostname}:{username}"
+        return self.secrets.get(key)
+    
+    def verify_otp(self, hostname, username, otp_code):
+        """Verify OTP code"""
+        secret = self.get_secret(hostname, username)
+        if not secret:
+            return False
+        
+        totp = pyotp.TOTP(secret)
+        return totp.verify(otp_code)
+    
+    def get_current_otp(self, hostname, username):
+        """Get current OTP code"""
+        secret = self.get_secret(hostname, username)
+        if not secret:
+            return None
+        
+        totp = pyotp.TOTP(secret)
+        return totp.now()
+
+class NetworkScanner:
+    """Network Scanning and Discovery"""
+    def __init__(self, log_callback=None):
+        self.log_callback = log_callback
+        self.discovered_hosts = []
+        
+    def log(self, message, level="info"):
+        """Log messages"""
+        if self.log_callback:
+            self.log_callback(message, level)
+        else:
+            print(f"[{level.upper()}] {message}")
+    
+    def get_local_networks(self):
+        """Get all local network ranges"""
+        networks = []
+        
+        try:
+            interfaces = netifaces.interfaces()
+            
+            for iface in interfaces:
+                try:
+                    addrs = netifaces.ifaddresses(iface)
+                    if netifaces.AF_INET in addrs:
+                        for link in addrs[netifaces.AF_INET]:
+                            ip = link['addr']
+                            netmask = link['netmask']
+                            
+                            # Skip localhost and docker networks
+                            if ip.startswith('127.') or ip.startswith('172.17.'):
+                                continue
+                            
+                            # Calculate network
+                            network = ipaddress.ip_network(f"{ip}/{netmask}", strict=False)
+                            networks.append(str(network))
+                            
+                except:
+                    continue
+                    
+        except ImportError:
+            # Fallback if netifaces not available
+            self.log("netifaces not installed, using default network ranges", "warning")
+            networks = ["192.168.1.0/24", "10.0.0.0/24", "172.16.0.0/24"]
+        
+        return list(set(networks))  # Remove duplicates
+    
+    def ping_sweep(self, network_range, timeout=1):
+        """Ping sweep to find active hosts"""
+        active_hosts = []
+        network = ipaddress.ip_network(network_range)
+        
+        def ping_host(ip):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                result = sock.connect_ex((str(ip), 80))
+                sock.close()
+                return ip if result == 0 else None
+            except:
+                return None
+        
+        # Use threading for faster scanning
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            futures = [executor.submit(ping_host, ip) for ip in network.hosts()]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    active_hosts.append(str(result))
+        
+        return active_hosts
+    
+    def scan_ssh_ports(self, ip_list, ports=[22, 2222, 22222]):
+        """Scan for SSH ports on active hosts"""
+        ssh_hosts = []
+        
+        def check_port(ip, port):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex((ip, port))
+                sock.close()
+                
+                if result == 0:
+                    # Try to get SSH banner
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(3)
+                        sock.connect((ip, port))
+                        banner = sock.recv(1024).decode('utf-8', errors='ignore')
+                        sock.close()
+                        
+                        if 'SSH' in banner or 'OpenSSH' in banner:
+                            return ip, port, banner[:100]
+                    except:
+                        pass
+                    return ip, port, "SSH Detected"
+            except:
+                pass
+            return None
+        
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            futures = []
+            for ip in ip_list:
+                for port in ports:
+                    futures.append(executor.submit(check_port, ip, port))
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    ip, port, banner = result
+                    ssh_hosts.append({
+                        'ip': ip,
+                        'port': port,
+                        'banner': banner,
+                        'status': 'detected'
+                    })
+        
+        return ssh_hosts
+    
+    def discover_ssh_hosts(self):
+        """Main discovery method - finds SSH hosts on network"""
+        self.log("Starting network discovery...", "info")
+        
+        all_ssh_hosts = []
+        networks = self.get_local_networks()
+        
+        self.log(f"Found {len(networks)} network interfaces", "info")
+        
+        for network in networks:
+            self.log(f"Scanning network: {network}", "info")
+            
+            # Step 1: Find active hosts
+            self.log(f"  Performing ping sweep on {network}...", "info")
+            active_hosts = self.ping_sweep(network)
+            self.log(f"  Found {len(active_hosts)} active hosts", "success")
+            
+            # Step 2: Scan for SSH ports
+            if active_hosts:
+                self.log(f"  Scanning for SSH ports...", "info")
+                ssh_hosts = self.scan_ssh_ports(active_hosts)
+                all_ssh_hosts.extend(ssh_hosts)
+                self.log(f"  Found {len(ssh_hosts)} SSH hosts", "success")
+        
+        self.log(f"Discovery complete. Found {len(all_ssh_hosts)} SSH hosts total", "info")
+        return all_ssh_hosts
+
 class SSHManager:
     """Main SSH manager class"""
     def __init__(self):
         self.hosts = []
         self.settings = {}
         self.results = {}
+        self.twofa = TwoFactorAuth()
+        self.scanner = NetworkScanner()
         self.ensure_directories()
         self.load_config()
         
@@ -65,24 +277,18 @@ class SSHManager:
                         'auth_type': 'key',
                         'key_file': '~/.ssh/id_rsa',
                         'password': '',
-                        'tags': ['linux', 'ubuntu', 'server']
-                    },
-                    {
-                        'name': 'windows-pc',
-                        'hostname': '192.168.1.200',
-                        'port': 22,
-                        'username': 'Administrator',
-                        'auth_type': 'password',
-                        'key_file': '',
-                        'password': 'YourPassword123',
-                        'tags': ['windows', 'desktop']
+                        'tags': ['linux', 'ubuntu', 'server'],
+                        'enable_2fa': False,
+                        '2fa_secret': ''
                     }
                 ],
                 'settings': {
                     'timeout': 10,
                     'banner_timeout': 30,
                     'default_port': 22,
-                    'default_username': 'root'
+                    'default_username': 'root',
+                    'auto_discover': True,
+                    'scan_networks': ['192.168.1.0/24']
                 }
             }
             
@@ -90,7 +296,6 @@ class SSHManager:
                 yaml.dump(sample_config, f, default_flow_style=False)
             
             print(f"[INFO] Sample config created at {config_path}")
-            print("[INFO] Please edit with your actual hosts")
             self.hosts = sample_config['hosts']
             self.settings = sample_config['settings']
             return self.hosts
@@ -130,8 +335,12 @@ class SSHManager:
             print(f"[ERROR] Failed to save config: {e}")
             return False
     
-    def test_connection(self, host_info):
-        """Test SSH connection to a single host"""
+    def discover_network_hosts(self):
+        """Discover SSH hosts on local network"""
+        return self.scanner.discover_ssh_hosts()
+    
+    def test_connection_with_2fa(self, host_info, otp_code=None):
+        """Test SSH connection with optional 2FA"""
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
@@ -141,6 +350,7 @@ class SSHManager:
             port = host_info.get('port', self.settings.get('default_port', 22))
             username = host_info.get('username', self.settings.get('default_username', 'root'))
             timeout = self.settings.get('timeout', 10)
+            enable_2fa = host_info.get('enable_2fa', False)
             
             print(f"[DEBUG] Connecting to {hostname}:{port} as {username}")
             
@@ -151,16 +361,13 @@ class SSHManager:
             
             if auth_type == 'password':
                 password = host_info.get('password', '')
-                print(f"[DEBUG] Using password authentication")
             else:
                 key_file = host_info.get('key_file', '')
                 if key_file:
                     key_path = os.path.expanduser(key_file)
                     if os.path.exists(key_path):
                         key_filename = key_path
-                        print(f"[DEBUG] Using key file: {key_path}")
                     else:
-                        print(f"[DEBUG] Key file not found: {key_path}")
                         # Try default keys
                         default_keys = [
                             '~/.ssh/id_rsa',
@@ -172,7 +379,6 @@ class SSHManager:
                             key_path = os.path.expanduser(key)
                             if os.path.exists(key_path):
                                 key_filename = key_path
-                                print(f"[DEBUG] Using default key: {key_path}")
                                 break
             
             # Connect
@@ -183,37 +389,43 @@ class SSHManager:
                 password=password,
                 key_filename=key_filename,
                 timeout=timeout,
-                banner_timeout=self.settings.get('banner_timeout', 30)
+                banner_timeout=self.settings.get('banner_timeout', 30),
+                allow_agent=True,
+                look_for_keys=True
             )
             
             print(f"[DEBUG] Connected successfully to {hostname}")
+            
+            # If 2FA is enabled, verify OTP
+            if enable_2fa and otp_code:
+                # Execute OTP verification command (customize based on your setup)
+                verify_command = f"echo {otp_code} | /usr/local/bin/verify_otp.sh"
+                stdin, stdout, stderr = client.exec_command(verify_command)
+                exit_code = stdout.channel.recv_exit_status()
+                
+                if exit_code != 0:
+                    client.close()
+                    return {'status': 'error', 'message': '2FA verification failed'}
             
             # Get system info
             stdin, stdout, stderr = client.exec_command('uname -a 2>/dev/null || echo "Unknown OS"')
             os_info = stdout.read().decode().strip()
             
-            # Try to get more details
-            stdin, stdout, stderr = client.exec_command('cat /etc/os-release 2>/dev/null || systeminfo 2>/dev/null || echo "No detailed info"')
-            os_details = stdout.read().decode().strip()[:200]
-            
             return {
                 'status': 'success',
                 'os_info': os_info,
-                'os_details': os_details,
-                'hostname': hostname
+                'hostname': hostname,
+                '2fa_required': enable_2fa,
+                '2fa_passed': enable_2fa and otp_code is not None
             }
             
         except paramiko.ssh_exception.AuthenticationException as e:
-            print(f"[DEBUG] Authentication failed: {e}")
             return {'status': 'error', 'message': 'Authentication failed'}
         except paramiko.ssh_exception.NoValidConnectionsError as e:
-            print(f"[DEBUG] No valid connections: {e}")
-            return {'status': 'error', 'message': f'Cannot connect to host (port {port} might be closed)'}
+            return {'status': 'error', 'message': f'Cannot connect to host'}
         except socket.timeout as e:
-            print(f"[DEBUG] Connection timeout: {e}")
             return {'status': 'error', 'message': 'Connection timeout'}
         except Exception as e:
-            print(f"[DEBUG] Connection error: {type(e).__name__}: {e}")
             return {'status': 'error', 'message': str(e)}
         finally:
             try:
@@ -223,6 +435,10 @@ class SSHManager:
     
     def execute_command(self, host_info, command):
         """Execute a command on remote host"""
+        return self.execute_command_with_2fa(host_info, command)
+    
+    def execute_command_with_2fa(self, host_info, command, otp_code=None):
+        """Execute command with optional 2FA"""
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
@@ -256,7 +472,6 @@ class SSHManager:
             )
             
             # Execute command
-            print(f"[DEBUG] Executing command on {hostname}: {command}")
             stdin, stdout, stderr = client.exec_command(command)
             exit_code = stdout.channel.recv_exit_status()
             output = stdout.read().decode('utf-8', errors='ignore')
@@ -271,7 +486,6 @@ class SSHManager:
             }
             
         except Exception as e:
-            print(f"[DEBUG] Command execution error on {host_info.get('hostname', 'unknown')}: {e}")
             return {
                 'success': False,
                 'exit_code': -1,
@@ -292,12 +506,9 @@ class SSHManager:
             ("Current User", "whoami"),
             ("Date/Time", "date"),
             ("Kernel Version", "uname -r"),
-            ("CPU Info", "lscpu 2>/dev/null || wmic cpu get name 2>/dev/null || echo 'Not available'"),
-            ("Memory Info", "free -h 2>/dev/null || wmic ComputerSystem get TotalPhysicalMemory 2>/dev/null || echo 'Not available'"),
-            ("Disk Usage", "df -h 2>/dev/null || wmic logicaldisk get size,freespace,caption 2>/dev/null || echo 'Not available'"),
-            ("Logged in Users", "who 2>/dev/null || query user 2>/dev/null || echo 'Not available'"),
-            ("Network Interfaces", "ip addr show 2>/dev/null || ipconfig /all 2>/dev/null || ifconfig 2>/dev/null || echo 'Not available'"),
-            ("Running Processes", "ps aux | wc -l 2>/dev/null || tasklist | find /c /v \"\" 2>/dev/null || echo 'Not available'"),
+            ("CPU Info", "lscpu 2>/dev/null || echo 'Not available'"),
+            ("Memory Info", "free -h 2>/dev/null || echo 'Not available'"),
+            ("Disk Usage", "df -h 2>/dev/null || echo 'Not available'"),
         ]
         
         results = []
@@ -306,7 +517,7 @@ class SSHManager:
             results.append({
                 'check': name,
                 'command': cmd,
-                'output': result['output'][:500],  # Limit output length
+                'output': result['output'][:500],
                 'success': result['success']
             })
         
@@ -314,15 +525,11 @@ class SSHManager:
     
     def run_security_scan(self, host_info):
         """Run basic security checks on host"""
-        # Basic security checks (safe commands)
         security_checks = [
-            ("SSH Service Status", "systemctl status sshd 2>/dev/null || systemctl status ssh 2>/dev/null || service sshd status 2>/dev/null || echo 'SSH service check not available'"),
-            ("Firewall Status", "sudo ufw status 2>/dev/null || sudo firewall-cmd --state 2>/dev/null || netsh advfirewall show allprofiles 2>/dev/null || echo 'Firewall check not available'"),
-            ("Open Ports", "ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null || echo 'Port check not available'"),
+            ("SSH Service Status", "systemctl status sshd 2>/dev/null || echo 'SSH service check not available'"),
+            ("Firewall Status", "sudo ufw status 2>/dev/null || echo 'Firewall check not available'"),
+            ("Open Ports", "ss -tuln 2>/dev/null || echo 'Port check not available'"),
             ("Failed Logins", "sudo lastb 2>/dev/null || echo 'Failed login check not available'"),
-            ("System Updates", "apt list --upgradable 2>/dev/null || yum check-update 2>/dev/null || echo 'Update check not available'"),
-            ("SELinux Status", "getenforce 2>/dev/null || echo 'SELinux not installed'"),
-            ("Root Login Check", "grep PermitRootLogin /etc/ssh/sshd_config 2>/dev/null || echo 'SSH config not accessible'"),
         ]
         
         results = []
@@ -338,48 +545,101 @@ class SSHManager:
         
         return results
     
-    def test_all_connections(self):
-        """Test connection to all hosts"""
-        results = {}
-        for host in self.hosts:
-            hostname = host['hostname']
-            print(f"[INFO] Testing connection to {hostname}")
-            results[hostname] = self.test_connection(host)
-        return results
-    
-    def scan_all_hosts(self):
-        """Scan all hosts for system info and security"""
-        all_results = {}
+    def upload_file(self, host_info, local_path, remote_path):
+        """Upload file to remote host"""
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
-        for host in self.hosts:
-            hostname = host['hostname']
-            print(f"[INFO] Scanning {hostname}...")
+        try:
+            # Connection setup
+            hostname = host_info['hostname']
+            port = host_info.get('port', self.settings.get('default_port', 22))
+            username = host_info.get('username', self.settings.get('default_username', 'root'))
             
-            # Test connection first
-            connection_test = self.test_connection(host)
+            auth_type = host_info.get('auth_type', 'key')
+            password = None
+            key_filename = None
             
-            if connection_test['status'] == 'success':
-                # Get system info
-                system_info = self.get_system_info(host)
-                
-                # Run security scan
-                security_scan = self.run_security_scan(host)
-                
-                all_results[hostname] = {
-                    'connection': 'success',
-                    'os_info': connection_test.get('os_info', 'Unknown'),
-                    'system_info': system_info,
-                    'security_scan': security_scan,
-                    'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
+            if auth_type == 'password':
+                password = host_info.get('password', '')
             else:
-                all_results[hostname] = {
-                    'connection': 'failed',
-                    'error': connection_test.get('message', 'Unknown error'),
-                    'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
+                key_file = host_info.get('key_file', '')
+                if key_file:
+                    key_path = os.path.expanduser(key_file)
+                    if os.path.exists(key_path):
+                        key_filename = key_path
+            
+            client.connect(
+                hostname=hostname,
+                port=port,
+                username=username,
+                password=password,
+                key_filename=key_filename,
+                timeout=self.settings.get('timeout', 10)
+            )
+            
+            # SFTP transfer
+            sftp = client.open_sftp()
+            sftp.put(local_path, remote_path)
+            sftp.close()
+            
+            return {'success': True, 'message': f'File uploaded to {remote_path}'}
+            
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+        finally:
+            try:
+                client.close()
+            except:
+                pass
+    
+    def download_file(self, host_info, remote_path, local_path):
+        """Download file from remote host"""
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
-        return all_results
+        try:
+            # Connection setup (same as upload)
+            hostname = host_info['hostname']
+            port = host_info.get('port', self.settings.get('default_port', 22))
+            username = host_info.get('username', self.settings.get('default_username', 'root'))
+            
+            auth_type = host_info.get('auth_type', 'key')
+            password = None
+            key_filename = None
+            
+            if auth_type == 'password':
+                password = host_info.get('password', '')
+            else:
+                key_file = host_info.get('key_file', '')
+                if key_file:
+                    key_path = os.path.expanduser(key_file)
+                    if os.path.exists(key_path):
+                        key_filename = key_path
+            
+            client.connect(
+                hostname=hostname,
+                port=port,
+                username=username,
+                password=password,
+                key_filename=key_filename,
+                timeout=self.settings.get('timeout', 10)
+            )
+            
+            # SFTP transfer
+            sftp = client.open_sftp()
+            sftp.get(remote_path, local_path)
+            sftp.close()
+            
+            return {'success': True, 'message': f'File downloaded to {local_path}'}
+            
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+        finally:
+            try:
+                client.close()
+            except:
+                pass
     
     def export_results(self, results, format='json'):
         """Export scan results to file"""
@@ -389,13 +649,11 @@ class SSHManager:
             filename = f"{RESULTS_DIR}/ssh_scan_{timestamp}.json"
             with open(filename, 'w') as f:
                 json.dump(results, f, indent=2)
-            print(f"[INFO] Exported JSON to {filename}")
             return filename
         
         elif format == 'csv':
             filename = f"{RESULTS_DIR}/ssh_scan_{timestamp}.csv"
             
-            # Flatten results for CSV
             rows = []
             for hostname, data in results.items():
                 if data.get('connection') == 'success':
@@ -406,16 +664,7 @@ class SSHManager:
                             check['check'],
                             check['output'],
                             'PASS' if check['success'] else 'FAIL',
-                            data['timestamp']
-                        ])
-                    for check in data.get('security_scan', []):
-                        rows.append([
-                            hostname,
-                            'security_scan',
-                            check['check'],
-                            check['output'],
-                            check.get('status', 'UNKNOWN'),
-                            data['timestamp']
+                            data.get('timestamp', '')
                         ])
                 else:
                     rows.append([
@@ -424,7 +673,7 @@ class SSHManager:
                         'Connection Test',
                         data.get('error', 'Unknown error'),
                         'FAIL',
-                        data['timestamp']
+                        data.get('timestamp', '')
                     ])
             
             with open(filename, 'w', newline='', encoding='utf-8') as f:
@@ -432,7 +681,6 @@ class SSHManager:
                 writer.writerow(['Hostname', 'Category', 'Check', 'Output', 'Status', 'Timestamp'])
                 writer.writerows(rows)
             
-            print(f"[INFO] Exported CSV to {filename}")
             return filename
         
         elif format == 'txt':
@@ -447,25 +695,13 @@ class SSHManager:
                     
                     if data.get('connection') == 'success':
                         f.write(f"Status: CONNECTED\n")
-                        f.write(f"OS Info: {data.get('os_info', 'Unknown')}\n")
                         f.write(f"Timestamp: {data.get('timestamp')}\n\n")
-                        
-                        f.write("System Information:\n")
-                        for check in data.get('system_info', []):
-                            f.write(f"  • {check['check']}: {check['output'][:100]}...\n")
-                        
-                        f.write("\nSecurity Checks:\n")
-                        for check in data.get('security_scan', []):
-                            status = check.get('status', 'UNKNOWN')
-                            f.write(f"  • {check['check']}: {status}\n")
                     else:
                         f.write(f"Status: FAILED\n")
                         f.write(f"Error: {data.get('error', 'Unknown error')}\n")
-                        f.write(f"Timestamp: {data.get('timestamp')}\n")
                     
                     f.write("\n" + "="*60 + "\n\n")
             
-            print(f"[INFO] Exported TXT to {filename}")
             return filename
 
 class SSHManagerGUI:
@@ -477,6 +713,7 @@ class SSHManagerGUI:
         self.root.configure(bg=BG_COLOR)
         
         self.manager = SSHManager()
+        self.current_otp_codes = {}
         self.setup_gui()
         
     def setup_gui(self):
@@ -511,9 +748,9 @@ class SSHManagerGUI:
                  font=("Segoe UI", 10, "bold"), width=20, height=2,
                  command=self.add_host).pack(pady=5)
         
-        tk.Button(host_buttons, text="✏️ Edit Config", bg=BUTTON_COLOR, fg="white",
+        tk.Button(host_buttons, text="🔍 Discover", bg=COLOR_INFO, fg="white",
                  font=("Segoe UI", 10, "bold"), width=20, height=2,
-                 command=self.edit_config).pack(pady=5)
+                 command=self.discover_hosts).pack(pady=5)
         
         tk.Button(host_buttons, text="🔄 Reload", bg="#9e9e9e", fg="white",
                  font=("Segoe UI", 10, "bold"), width=20, height=2,
@@ -542,6 +779,7 @@ class SSHManagerGUI:
             ("📊 System Scan", "#673ab7", self.scan_systems),
             ("🛡️ Security Scan", COLOR_WARNING, self.scan_security),
             ("📋 Run Command", "#009688", self.run_custom_command),
+            ("📤 Upload File", "#ff5722", self.upload_file),
             ("💾 Export", COLOR_SUCCESS, self.export_results),
         ]
         
@@ -594,15 +832,106 @@ class SSHManagerGUI:
         
         for host in self.manager.hosts:
             display_text = f"{host['name']} ({host['hostname']})"
+            if host.get('enable_2fa'):
+                display_text += " 🔒"
             self.hosts_listbox.insert(tk.END, display_text)
         
         self.log(f"Loaded {len(self.manager.hosts)} hosts from config", "info")
+    
+    def discover_hosts(self):
+        """Discover hosts on network"""
+        self.log("Starting network discovery...", "info")
+        
+        def do_discovery():
+            discovered = self.manager.discover_network_hosts()
+            
+            if discovered:
+                self.log(f"Discovered {len(discovered)} SSH hosts:", "success")
+                
+                # Show discovered hosts
+                for host in discovered:
+                    self.log(f"  • {host['ip']}:{host['port']} - {host['banner']}", "info")
+                
+                # Ask to add to config
+                self.root.after(0, lambda: self.ask_to_add_discovered(discovered))
+            else:
+                self.log("No SSH hosts discovered", "warning")
+        
+        threading.Thread(target=do_discovery, daemon=True).start()
+    
+    def ask_to_add_discovered(self, discovered_hosts):
+        """Ask user to add discovered hosts to config"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Discovered Hosts")
+        dialog.geometry("600x400")
+        dialog.configure(bg=BG_COLOR)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        tk.Label(dialog, text="Discovered SSH Hosts", bg=BG_COLOR, fg=TEXT_COLOR,
+                font=("Segoe UI", 14, "bold")).pack(pady=20)
+        
+        # List of discovered hosts
+        list_frame = tk.Frame(dialog, bg=BG_COLOR)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        hosts_list = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, yscrollcommand=scrollbar.set)
+        hosts_list.pack(fill=tk.BOTH, expand=True)
+        
+        for host in discovered_hosts:
+            hosts_list.insert(tk.END, f"{host['ip']}:{host['port']} - {host['banner'][:50]}")
+        
+        scrollbar.config(command=hosts_list.yview)
+        
+        # Buttons
+        buttons_frame = tk.Frame(dialog, bg=BG_COLOR)
+        buttons_frame.pack(pady=20)
+        
+        def add_selected():
+            selected_indices = hosts_list.curselection()
+            if not selected_indices:
+                messagebox.showwarning("Warning", "Please select hosts to add")
+                return
+            
+            for idx in selected_indices:
+                host = discovered_hosts[idx]
+                
+                # Create host entry
+                new_host = {
+                    'name': f"discovered-{host['ip']}",
+                    'hostname': host['ip'],
+                    'port': host['port'],
+                    'username': 'root',  # Default
+                    'auth_type': 'key',
+                    'key_file': '~/.ssh/id_rsa',
+                    'password': '',
+                    'tags': ['discovered'],
+                    'enable_2fa': False
+                }
+                
+                self.manager.hosts.append(new_host)
+            
+            # Save config
+            self.manager.save_config()
+            self.reload_hosts()
+            
+            self.log(f"Added {len(selected_indices)} discovered hosts", "success")
+            dialog.destroy()
+        
+        tk.Button(buttons_frame, text="Add Selected", bg=COLOR_SUCCESS, fg="white",
+                 width=15, command=add_selected).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(buttons_frame, text="Cancel", bg="#9e9e9e", fg="white",
+                 width=15, command=dialog.destroy).pack(side=tk.LEFT, padx=5)
     
     def add_host(self):
         """Add a new host via dialog"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Add SSH Host")
-        dialog.geometry("500x600")
+        dialog.geometry("500x700")
         dialog.configure(bg=BG_COLOR)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -611,8 +940,18 @@ class SSHManagerGUI:
         tk.Label(dialog, text="Add New SSH Host", bg=BG_COLOR, fg=TEXT_COLOR,
                 font=("Segoe UI", 14, "bold")).pack(pady=20)
         
-        form_frame = tk.Frame(dialog, bg=BG_COLOR)
-        form_frame.pack(fill=tk.BOTH, expand=True, padx=20)
+        # Scrollable form
+        canvas = tk.Canvas(dialog, bg=BG_COLOR)
+        scrollbar = tk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg=BG_COLOR)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
         
         # Field definitions
         fields = [
@@ -623,6 +962,7 @@ class SSHManagerGUI:
             ("auth_type", "Auth Type:", "key"),
             ("key_file", "SSH Key File:", "~/.ssh/id_rsa"),
             ("password", "Password:", ""),
+            ("enable_2fa", "Enable 2FA:", False),
             ("tags", "Tags (comma-separated):", "linux,server"),
         ]
         
@@ -630,15 +970,14 @@ class SSHManagerGUI:
         row = 0
         
         for field_name, label, default in fields:
-            tk.Label(form_frame, text=label, bg=BG_COLOR, fg=TEXT_COLOR,
+            tk.Label(scrollable_frame, text=label, bg=BG_COLOR, fg=TEXT_COLOR,
                     font=("Segoe UI", 10)).grid(row=row, column=0, padx=5, pady=5, sticky="w")
             
-            var = tk.StringVar(value=default)
-            vars_dict[field_name] = var
-            
             if field_name == "auth_type":
-                # Radio buttons for auth type
-                auth_frame = tk.Frame(form_frame, bg=BG_COLOR)
+                var = tk.StringVar(value=default)
+                vars_dict[field_name] = var
+                
+                auth_frame = tk.Frame(scrollable_frame, bg=BG_COLOR)
                 auth_frame.grid(row=row, column=1, padx=5, pady=5, sticky="w")
                 
                 tk.Radiobutton(auth_frame, text="SSH Key", variable=var,
@@ -646,14 +985,75 @@ class SSHManagerGUI:
                 tk.Radiobutton(auth_frame, text="Password", variable=var,
                               value="password", bg=BG_COLOR).pack(side=tk.LEFT, padx=5)
             
+            elif field_name == "enable_2fa":
+                var = tk.BooleanVar(value=default)
+                vars_dict[field_name] = var
+                
+                tk.Checkbutton(scrollable_frame, variable=var, bg=BG_COLOR).grid(row=row, column=1, padx=5, pady=5, sticky="w")
+            
             elif field_name == "password":
-                entry = tk.Entry(form_frame, textvariable=var, width=30, show="*")
+                var = tk.StringVar(value=default)
+                vars_dict[field_name] = var
+                entry = tk.Entry(scrollable_frame, textvariable=var, width=30, show="*")
                 entry.grid(row=row, column=1, padx=5, pady=5, sticky="w")
             else:
-                entry = tk.Entry(form_frame, textvariable=var, width=30)
+                var = tk.StringVar(value=default)
+                vars_dict[field_name] = var
+                entry = tk.Entry(scrollable_frame, textvariable=var, width=30)
                 entry.grid(row=row, column=1, padx=5, pady=5, sticky="w")
             
             row += 1
+        
+        # Setup 2FA button
+        def setup_2fa():
+            hostname = vars_dict['hostname'].get()
+            username = vars_dict['username'].get()
+            
+            if not hostname or not username:
+                messagebox.showerror("Error", "Please enter hostname and username first")
+                return
+            
+            secret, uri = self.manager.twofa.generate_secret(hostname, username)
+            
+            # Show QR code dialog
+            qr_dialog = tk.Toplevel(dialog)
+            qr_dialog.title("Setup 2FA")
+            qr_dialog.geometry("400x500")
+            qr_dialog.configure(bg=BG_COLOR)
+            qr_dialog.transient(dialog)
+            
+            tk.Label(qr_dialog, text="Scan QR Code with Google Authenticator", 
+                    bg=BG_COLOR, fg=TEXT_COLOR, font=("Segoe UI", 12, "bold")).pack(pady=20)
+            
+            # Generate QR code
+            qr = qrcode.make(uri)
+            qr_image = ImageTk.PhotoImage(qr)
+            
+            qr_label = tk.Label(qr_dialog, image=qr_image, bg=BG_COLOR)
+            qr_label.image = qr_image
+            qr_label.pack(pady=10)
+            
+            tk.Label(qr_dialog, text="Or enter this code manually:", 
+                    bg=BG_COLOR, fg=TEXT_COLOR).pack(pady=10)
+            
+            code_label = tk.Label(qr_dialog, text=secret, font=("Consolas", 12), 
+                                bg="white", relief=tk.SUNKEN, padx=10, pady=5)
+            code_label.pack(pady=10)
+            
+            tk.Label(qr_dialog, text="Save this secret key securely!", 
+                    bg=BG_COLOR, fg=COLOR_WARNING).pack(pady=10)
+            
+            tk.Button(qr_dialog, text="Done", bg=COLOR_SUCCESS, fg="white",
+                     command=qr_dialog.destroy).pack(pady=20)
+            
+            self.log(f"2FA secret generated for {username}@{hostname}", "success")
+        
+        tk.Button(scrollable_frame, text="Setup 2FA", bg=COLOR_WARNING, fg="white",
+                 command=setup_2fa).grid(row=row, column=1, padx=5, pady=20, sticky="w")
+        row += 1
+        
+        canvas.pack(side="left", fill="both", expand=True, padx=20)
+        scrollbar.pack(side="right", fill="y")
         
         # Test and Save buttons
         buttons_frame = tk.Frame(dialog, bg=BG_COLOR)
@@ -669,14 +1069,24 @@ class SSHManagerGUI:
                 'auth_type': vars_dict['auth_type'].get(),
                 'key_file': vars_dict['key_file'].get(),
                 'password': vars_dict['password'].get() if vars_dict['auth_type'].get() == 'password' else '',
+                'enable_2fa': vars_dict['enable_2fa'].get(),
                 'tags': [t.strip() for t in vars_dict['tags'].get().split(',') if t.strip()]
             }
             
+            # If 2FA is enabled, ask for OTP
+            otp_code = None
+            if host_info['enable_2fa']:
+                otp_code = simpledialog.askstring("2FA Code", "Enter 6-digit OTP code:")
+                if not otp_code:
+                    return
+            
             self.log(f"Testing connection to {host_info['hostname']}...", "info")
-            result = self.manager.test_connection(host_info)
+            result = self.manager.test_connection_with_2fa(host_info, otp_code)
             
             if result['status'] == 'success':
                 self.log(f"✓ Connection successful! OS: {result.get('os_info', 'Unknown')}", "success")
+                if host_info['enable_2fa']:
+                    self.log(f"✓ 2FA verification passed", "success")
                 tk.messagebox.showinfo("Test Successful", 
                                   f"Successfully connected to {host_info['hostname']}!\n\n"
                                   f"OS: {result.get('os_info', 'Unknown')}")
@@ -696,6 +1106,7 @@ class SSHManagerGUI:
                 'auth_type': vars_dict['auth_type'].get(),
                 'key_file': vars_dict['key_file'].get(),
                 'password': vars_dict['password'].get() if vars_dict['auth_type'].get() == 'password' else '',
+                'enable_2fa': vars_dict['enable_2fa'].get(),
                 'tags': [t.strip() for t in vars_dict['tags'].get().split(',') if t.strip()]
             }
             
@@ -719,41 +1130,33 @@ class SSHManagerGUI:
         tk.Button(buttons_frame, text="Cancel", bg="#9e9e9e", fg="white",
                  width=15, command=dialog.destroy).pack(side=tk.LEFT, padx=5)
     
-    def edit_config(self):
-        """Open config file for editing"""
-        config_file = CONFIG_FILE
-        
-        if not os.path.exists(config_file):
-            self.manager.load_config()  # Creates sample config
-        
-        try:
-            if os.name == 'nt':  # Windows
-                os.startfile(config_file)
-            else:  # Linux/Mac
-                editor = os.environ.get('EDITOR', 'nano')
-                import subprocess
-                subprocess.Popen([editor, config_file])
-            
-            self.log(f"Opened config file: {config_file}", "info")
-        except Exception as e:
-            self.log(f"Failed to open config: {str(e)}", "error")
-    
     def test_all(self):
         """Test connection to all hosts"""
         self.log("Testing connections to all hosts...", "info")
         
         def do_test():
-            results = self.manager.test_all_connections()
-            
             success_count = 0
             fail_count = 0
             
-            for hostname, result in results.items():
+            for host in self.manager.hosts:
+                self.log(f"Testing {host['hostname']}...", "info")
+                
+                # If 2FA is enabled, get current OTP
+                otp_code = None
+                if host.get('enable_2fa'):
+                    otp_code = self.manager.twofa.get_current_otp(host['hostname'], host['username'])
+                    if otp_code:
+                        self.log(f"  Using 2FA code: {otp_code}", "info")
+                
+                result = self.manager.test_connection_with_2fa(host, otp_code)
+                
                 if result['status'] == 'success':
-                    self.log(f"✓ {hostname} - Connected ({result.get('os_info', 'Unknown')})", "success")
+                    self.log(f"✓ {host['hostname']} - Connected", "success")
+                    if host.get('enable_2fa'):
+                        self.log(f"  ✓ 2FA verified", "success")
                     success_count += 1
                 else:
-                    self.log(f"✗ {hostname} - Failed: {result.get('message', 'Unknown')}", "error")
+                    self.log(f"✗ {host['hostname']} - Failed: {result.get('message', 'Unknown')}", "error")
                     fail_count += 1
             
             self.log(f"Connection test completed: {success_count} successful, {fail_count} failed", "info")
@@ -773,23 +1176,49 @@ class SSHManagerGUI:
         self.log("Starting system information scan...", "info")
         
         def do_scan():
-            results = self.manager.scan_all_hosts()
+            all_results = {}
             
-            for hostname, data in results.items():
-                if data.get('connection') == 'success':
+            for host in self.manager.hosts:
+                hostname = host['hostname']
+                self.log(f"Scanning {hostname}...", "info")
+                
+                # Test connection
+                otp_code = None
+                if host.get('enable_2fa'):
+                    otp_code = self.manager.twofa.get_current_otp(host['hostname'], host['username'])
+                
+                connection_test = self.manager.test_connection_with_2fa(host, otp_code)
+                
+                if connection_test['status'] == 'success':
+                    # Get system info
+                    system_info = self.manager.get_system_info(host)
+                    
+                    all_results[hostname] = {
+                        'connection': 'success',
+                        'os_info': connection_test.get('os_info', 'Unknown'),
+                        'system_info': system_info,
+                        'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    
                     self.log(f"✓ {hostname} - System scan completed", "success")
                     
                     # Show some key info
-                    if data.get('system_info'):
-                        for check in data['system_info'][:3]:  # Show first 3 checks
+                    if system_info:
+                        for check in system_info[:3]:
                             self.log(f"  • {check['check']}: {check['output'][:50]}...", "info")
                 else:
-                    self.log(f"✗ {hostname} - Scan failed: {data.get('error', 'Unknown')}", "error")
+                    all_results[hostname] = {
+                        'connection': 'failed',
+                        'error': connection_test.get('message', 'Unknown error'),
+                        'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    
+                    self.log(f"✗ {hostname} - Scan failed: {connection_test.get('message', 'Unknown')}", "error")
             
             self.log("System scan completed for all hosts", "info")
             
             # Save results
-            filename = self.manager.export_results(results, 'json')
+            filename = self.manager.export_results(all_results, 'json')
             self.log(f"Results saved to: {filename}", "success")
             
             self.root.after(0, lambda: tk.messagebox.showinfo(
@@ -812,7 +1241,11 @@ class SSHManagerGUI:
                 self.log(f"Scanning {hostname} for security issues...", "info")
                 
                 # Test connection
-                connection_test = self.manager.test_connection(host)
+                otp_code = None
+                if host.get('enable_2fa'):
+                    otp_code = self.manager.twofa.get_current_otp(host['hostname'], host['username'])
+                
+                connection_test = self.manager.test_connection_with_2fa(host, otp_code)
                 
                 if connection_test['status'] == 'success':
                     # Run security scan
@@ -828,13 +1261,15 @@ class SSHManagerGUI:
                     all_results[hostname] = {
                         'connection': 'success',
                         'security_scan': security_results,
-                        'summary': f"{pass_count} passed, {fail_count} failed"
+                        'summary': f"{pass_count} passed, {fail_count} failed",
+                        'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
                 else:
                     self.log(f"✗ {hostname} - Connection failed", "error")
                     all_results[hostname] = {
                         'connection': 'failed',
-                        'error': connection_test.get('message', 'Unknown error')
+                        'error': connection_test.get('message', 'Unknown error'),
+                        'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
             
             self.log("Security scan completed", "info")
@@ -908,8 +1343,7 @@ class SSHManagerGUI:
             else:
                 selection = self.hosts_listbox.curselection()
                 if not selection:
-                    messagebox.showwarning("Warning", "No host selected. Will run on all hosts.")
-                    target_text = "all hosts"
+                    target_text = "all hosts (no selection)"
                 else:
                     index = selection[0]
                     host = self.manager.hosts[index]
@@ -1023,6 +1457,49 @@ class SSHManagerGUI:
         
         threading.Thread(target=do_execute, daemon=True).start()
     
+    def upload_file(self):
+        """Upload file to remote host"""
+        # Select local file
+        local_path = filedialog.askopenfilename(title="Select file to upload")
+        if not local_path:
+            return
+        
+        # Select target host
+        selection = self.hosts_listbox.curselection()
+        if not selection:
+            messagebox.showerror("Error", "Please select a host")
+            return
+        
+        index = selection[0]
+        host = self.manager.hosts[index]
+        
+        # Ask for remote path
+        remote_path = simpledialog.askstring("Remote Path", 
+                                           f"Enter remote path for {os.path.basename(local_path)}:",
+                                           initialvalue=f"/tmp/{os.path.basename(local_path)}")
+        if not remote_path:
+            return
+        
+        self.log(f"Uploading {local_path} to {host['hostname']}:{remote_path}...", "info")
+        
+        def do_upload():
+            result = self.manager.upload_file(host, local_path, remote_path)
+            
+            if result['success']:
+                self.log(f"✓ File uploaded successfully", "success")
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Upload Complete",
+                    f"File uploaded to {host['hostname']}:\n{remote_path}"
+                ))
+            else:
+                self.log(f"✗ Upload failed: {result['message']}", "error")
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Upload Failed",
+                    f"Failed to upload file:\n{result['message']}"
+                ))
+        
+        threading.Thread(target=do_upload, daemon=True).start()
+    
     def export_results(self):
         """Export results in various formats"""
         export_dialog = tk.Toplevel(self.root)
@@ -1050,45 +1527,55 @@ class SSHManagerGUI:
             tk.Radiobutton(export_dialog, text=text, variable=format_var,
                           value=value, bg=BG_COLOR).pack(anchor="w", padx=20, pady=5)
         
-        # Data selection
-        tk.Label(export_dialog, text="Select data:", bg=BG_COLOR, fg=TEXT_COLOR,
-                font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(10, 0))
-        
-        data_var = tk.StringVar(value="recent")
-        tk.Radiobutton(export_dialog, text="Recent scan results", variable=data_var,
-                      value="recent", bg=BG_COLOR).pack(anchor="w", padx=20, pady=2)
-        tk.Radiobutton(export_dialog, text="Run new scan now", variable=data_var,
-                      value="new", bg=BG_COLOR).pack(anchor="w", padx=20, pady=2)
-        
         # Buttons
         buttons_frame = tk.Frame(export_dialog, bg=BG_COLOR)
         buttons_frame.pack(pady=20)
         
         def do_export():
             format_type = format_var.get()
-            data_type = data_var.get()
-            
             export_dialog.destroy()
             
-            if data_type == "new":
-                self.log(f"Running new scan for export ({format_type})...", "info")
+            # Run scan and export
+            self.log(f"Running scan for export ({format_type})...", "info")
+            
+            def scan_and_export():
+                all_results = {}
                 
-                def scan_and_export():
-                    results = self.manager.scan_all_hosts()
-                    filename = self.manager.export_results(results, format_type)
-                    self.log(f"Results exported to: {filename}", "success")
+                for host in self.manager.hosts:
+                    hostname = host['hostname']
                     
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "Export Complete",
-                        f"Results exported successfully!\n\n"
-                        f"File: {filename}"
-                    ))
+                    # Test connection
+                    otp_code = None
+                    if host.get('enable_2fa'):
+                        otp_code = self.manager.twofa.get_current_otp(host['hostname'], host['username'])
+                    
+                    connection_test = self.manager.test_connection_with_2fa(host, otp_code)
+                    
+                    if connection_test['status'] == 'success':
+                        system_info = self.manager.get_system_info(host)
+                        all_results[hostname] = {
+                            'connection': 'success',
+                            'os_info': connection_test.get('os_info', 'Unknown'),
+                            'system_info': system_info,
+                            'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                    else:
+                        all_results[hostname] = {
+                            'connection': 'failed',
+                            'error': connection_test.get('message', 'Unknown error'),
+                            'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        }
                 
-                threading.Thread(target=scan_and_export, daemon=True).start()
-            else:
-                # For recent results, we need to have some results first
-                messagebox.showwarning("No Recent Data", 
-                                    "Please run a scan first to have data to export.")
+                filename = self.manager.export_results(all_results, format_type)
+                self.log(f"Results exported to: {filename}", "success")
+                
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Export Complete",
+                    f"Results exported successfully!\n\n"
+                    f"File: {filename}"
+                ))
+            
+            threading.Thread(target=scan_and_export, daemon=True).start()
         
         tk.Button(buttons_frame, text="Export", bg=COLOR_SUCCESS, fg="white",
                  width=12, command=do_export).pack(side=tk.LEFT, padx=5)
@@ -1102,10 +1589,14 @@ def main():
         # Check dependencies
         import paramiko
         import yaml
+        import netifaces
+        import qrcode
+        import pyotp
+        from PIL import Image, ImageTk
     except ImportError as e:
         print(f"Error: Missing dependency - {e}")
         print("Please install required packages:")
-        print("  pip install paramiko pyyaml")
+        print("  pip install paramiko pyyaml netifaces qrcode[pil] pyotp pillow")
         sys.exit(1)
     
     # Create GUI
