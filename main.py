@@ -127,19 +127,35 @@ class PDFReportGenerator:
     def calculate_compliance_stats(self, module_name=None):
         cursor = self.db.cursor()
         
+        # Get only latest results for accurate stats
         if module_name:
             query = """
-                SELECT status, COUNT(*) as count 
-                FROM scan_results 
-                WHERE module_name=?
-                GROUP BY status
+                SELECT s1.status, COUNT(*) as count 
+                FROM scan_results s1
+                INNER JOIN (
+                    SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                    FROM scan_results 
+                    WHERE module_name=?
+                    GROUP BY policy_id, module_name
+                ) s2 ON s1.policy_id = s2.policy_id 
+                    AND s1.module_name = s2.module_name 
+                    AND s1.scan_timestamp = s2.max_timestamp
+                WHERE s1.module_name=?
+                GROUP BY s1.status
             """
-            cursor.execute(query, (module_name,))
+            cursor.execute(query, (module_name, module_name))
         else:
             query = """
-                SELECT status, COUNT(*) as count 
-                FROM scan_results 
-                GROUP BY status
+                SELECT s1.status, COUNT(*) as count 
+                FROM scan_results s1
+                INNER JOIN (
+                    SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                    FROM scan_results 
+                    GROUP BY policy_id, module_name
+                ) s2 ON s1.policy_id = s2.policy_id 
+                    AND s1.module_name = s2.module_name 
+                    AND s1.scan_timestamp = s2.max_timestamp
+                GROUP BY s1.status
             """
             cursor.execute(query)
         
@@ -312,17 +328,34 @@ class PDFReportGenerator:
         cursor = self.db.cursor()
         
         if module_name:
+            # Get only latest results for each policy
             cursor.execute("""
-                SELECT policy_id, policy_name, expected_value, current_value, status 
-                FROM scan_results 
-                WHERE module_name=?
-                ORDER BY policy_id
-            """, (module_name,))
+                SELECT s1.policy_id, s1.policy_name, s1.expected_value, s1.current_value, s1.status 
+                FROM scan_results s1
+                INNER JOIN (
+                    SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                    FROM scan_results 
+                    WHERE module_name=?
+                    GROUP BY policy_id, module_name
+                ) s2 ON s1.policy_id = s2.policy_id 
+                    AND s1.module_name = s2.module_name 
+                    AND s1.scan_timestamp = s2.max_timestamp
+                WHERE s1.module_name=?
+                ORDER BY s1.policy_id
+            """, (module_name, module_name))
         else:
+            # Get only latest results for each policy across all modules
             cursor.execute("""
-                SELECT module_name, policy_id, policy_name, expected_value, current_value, status 
-                FROM scan_results 
-                ORDER BY module_name, policy_id
+                SELECT s1.module_name, s1.policy_id, s1.policy_name, s1.expected_value, s1.current_value, s1.status 
+                FROM scan_results s1
+                INNER JOIN (
+                    SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                    FROM scan_results 
+                    GROUP BY policy_id, module_name
+                ) s2 ON s1.policy_id = s2.policy_id 
+                    AND s1.module_name = s2.module_name 
+                    AND s1.scan_timestamp = s2.max_timestamp
+                ORDER BY s1.module_name, s1.policy_id
             """)
         
         rows = cursor.fetchall()
@@ -462,14 +495,22 @@ class PDFReportGenerator:
                     ["Total", str(stats['total_rules']), "100%"]
                 ]
             else:
+                # Get module stats from latest results only
                 cursor.execute("""
-                    SELECT module_name, 
+                    SELECT s1.module_name, 
                            COUNT(*) as total,
-                           SUM(CASE WHEN status='PASS' THEN 1 ELSE 0 END) as passed,
-                           SUM(CASE WHEN status='FAIL' THEN 1 ELSE 0 END) as failed
-                    FROM scan_results 
-                    GROUP BY module_name
-                    ORDER BY module_name
+                           SUM(CASE WHEN s1.status='PASS' THEN 1 ELSE 0 END) as passed,
+                           SUM(CASE WHEN s1.status='FAIL' THEN 1 ELSE 0 END) as failed
+                    FROM scan_results s1
+                    INNER JOIN (
+                        SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                        FROM scan_results 
+                        GROUP BY policy_id, module_name
+                    ) s2 ON s1.policy_id = s2.policy_id 
+                        AND s1.module_name = s2.module_name 
+                        AND s1.scan_timestamp = s2.max_timestamp
+                    GROUP BY s1.module_name
+                    ORDER BY s1.module_name
                 """)
                 module_stats = cursor.fetchall()
                 
@@ -761,6 +802,16 @@ class HardeningApp:
             btn.pack(padx=10, pady=3)
             btn.bind("<Enter>", lambda e, b=btn: b.configure(relief=tk.SUNKEN))
             btn.bind("<Leave>", lambda e, b=btn: b.configure(relief=tk.RAISED))
+
+        # Add Clean DB button
+        cleanup_btn = tk.Button(actions_frame, text="Clean DB", width=20, height=1,
+                              font=("Segoe UI", 9),
+                              bg="#ff9800", fg="white",
+                              relief=tk.RAISED, borderwidth=1,
+                              command=self.cleanup_duplicates)
+        cleanup_btn.pack(padx=10, pady=3)
+        cleanup_btn.bind("<Enter>", lambda e, b=cleanup_btn: b.configure(relief=tk.SUNKEN))
+        cleanup_btn.bind("<Leave>", lambda e, b=cleanup_btn: b.configure(relief=tk.RAISED))
 
         stats_frame = LabelFrame(self.left_frame, text=" SYSTEM INFO ", font=("Segoe UI", 11, "bold"),
                                 bg=SIDEBAR_COLOR, fg=TEXT_COLOR, relief=tk.FLAT, borderwidth=0)
@@ -1126,6 +1177,7 @@ class HardeningApp:
         self.clear_filter()
     
     def load_scan_results(self, module_name):
+        """Load only the latest scan results for each policy"""
         self.tree.delete(*self.tree.get_children())
         
         if not self.conn:
@@ -1139,12 +1191,22 @@ class HardeningApp:
                 self.append_console(f"[INFO] scan_results table doesn't exist yet. Run a scan first.")
                 return
             
+            # Get only latest results for each policy (based on timestamp)
             cursor.execute("""
-                SELECT policy_id, policy_name, expected_value, current_value, status 
-                FROM scan_results 
-                WHERE module_name=?
-                ORDER BY policy_id
-            """, (module_name,))
+                SELECT s1.policy_id, s1.policy_name, s1.expected_value, s1.current_value, s1.status 
+                FROM scan_results s1
+                INNER JOIN (
+                    SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                    FROM scan_results 
+                    WHERE module_name=?
+                    GROUP BY policy_id, module_name
+                ) s2 ON s1.policy_id = s2.policy_id 
+                    AND s1.module_name = s2.module_name 
+                    AND s1.scan_timestamp = s2.max_timestamp
+                WHERE s1.module_name=?
+                ORDER BY s1.policy_id
+            """, (module_name, module_name))
+            
             rows = cursor.fetchall()
             
             if not rows:
@@ -1783,12 +1845,22 @@ Module:        {MODULES[self.current_module_index][0]}
                 cell.fill = PatternFill(start_color="FFE0E0E0", end_color="FFE0E0E0", fill_type="solid")
             
             cursor = self.conn.cursor()
+            # Get only latest results for export
             cursor.execute("""
-                SELECT policy_id, policy_name, expected_value, current_value, status, module_name, scan_timestamp
-                FROM scan_results 
-                WHERE module_name=?
-                ORDER BY policy_id
-            """, (module_name,))
+                SELECT s1.policy_id, s1.policy_name, s1.expected_value, s1.current_value, s1.status, s1.module_name, s1.scan_timestamp
+                FROM scan_results s1
+                INNER JOIN (
+                    SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                    FROM scan_results 
+                    WHERE module_name=?
+                    GROUP BY policy_id, module_name
+                ) s2 ON s1.policy_id = s2.policy_id 
+                    AND s1.module_name = s2.module_name 
+                    AND s1.scan_timestamp = s2.max_timestamp
+                WHERE s1.module_name=?
+                ORDER BY s1.policy_id
+            """, (module_name, module_name))
+            
             rows = cursor.fetchall()
             
             for row_num, row in enumerate(rows, 2):
@@ -1869,12 +1941,22 @@ Module:        {MODULES[self.current_module_index][0]}
                     cell.fill = PatternFill(start_color="FFE0E0E0", end_color="FFE0E0E0", fill_type="solid")
                 
                 cursor = self.conn.cursor()
+                # Get only latest results for each module
                 cursor.execute("""
-                    SELECT policy_id, policy_name, expected_value, current_value, status, scan_timestamp
-                    FROM scan_results 
-                    WHERE module_name=?
-                    ORDER BY policy_id
-                """, (module_name,))
+                    SELECT s1.policy_id, s1.policy_name, s1.expected_value, s1.current_value, s1.status, s1.scan_timestamp
+                    FROM scan_results s1
+                    INNER JOIN (
+                        SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                        FROM scan_results 
+                        WHERE module_name=?
+                        GROUP BY policy_id, module_name
+                    ) s2 ON s1.policy_id = s2.policy_id 
+                        AND s1.module_name = s2.module_name 
+                        AND s1.scan_timestamp = s2.max_timestamp
+                    WHERE s1.module_name=?
+                    ORDER BY s1.policy_id
+                """, (module_name, module_name))
+                
                 rows = cursor.fetchall()
                 
                 for row_num, row in enumerate(rows, 2):
@@ -1950,15 +2032,50 @@ Module:        {MODULES[self.current_module_index][0]}
             try:
                 cursor = self.conn.cursor()
                 
-                cursor.execute("SELECT COUNT(*) FROM scan_results")
-                total_policies = cursor.fetchone()[0]
+                # Get unique policy count (latest results only)
+                cursor.execute("""
+                    SELECT COUNT(DISTINCT s1.policy_id || s1.module_name) as unique_policies
+                    FROM scan_results s1
+                    INNER JOIN (
+                        SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                        FROM scan_results 
+                        GROUP BY policy_id, module_name
+                    ) s2 ON s1.policy_id = s2.policy_id 
+                        AND s1.module_name = s2.module_name 
+                        AND s1.scan_timestamp = s2.max_timestamp
+                """)
+                total_policies = cursor.fetchone()[0] or 0
                 
-                cursor.execute("SELECT COUNT(*) FROM scan_results WHERE status='PASS'")
-                passed = cursor.fetchone()[0]
+                cursor.execute("""
+                    SELECT COUNT(*) as passed
+                    FROM scan_results s1
+                    INNER JOIN (
+                        SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                        FROM scan_results 
+                        GROUP BY policy_id, module_name
+                    ) s2 ON s1.policy_id = s2.policy_id 
+                        AND s1.module_name = s2.module_name 
+                        AND s1.scan_timestamp = s2.max_timestamp
+                    WHERE s1.status='PASS'
+                """)
+                passed = cursor.fetchone()['passed'] or 0
                 
                 compliance = int((passed / total_policies * 100)) if total_policies > 0 else 0
                 
-                cursor.execute("SELECT module_name, COUNT(*) FROM scan_results GROUP BY module_name")
+                # Get module counts from latest results only
+                cursor.execute("""
+                    SELECT s1.module_name, COUNT(*) as count
+                    FROM scan_results s1
+                    INNER JOIN (
+                        SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                        FROM scan_results 
+                        GROUP BY policy_id, module_name
+                    ) s2 ON s1.policy_id = s2.policy_id 
+                        AND s1.module_name = s2.module_name 
+                        AND s1.scan_timestamp = s2.max_timestamp
+                    GROUP BY s1.module_name
+                    ORDER BY s1.module_name
+                """)
                 module_counts = cursor.fetchall()
                 
                 stats_text = f"""
@@ -1975,8 +2092,20 @@ Module:        {MODULES[self.current_module_index][0]}
                 """
                 
                 for module, count in module_counts:
-                    cursor.execute("SELECT COUNT(*) FROM scan_results WHERE module_name=? AND status='PASS'", (module,))
-                    module_passed = cursor.fetchone()[0]
+                    cursor.execute("""
+                        SELECT COUNT(*) as passed
+                        FROM scan_results s1
+                        INNER JOIN (
+                            SELECT policy_id, module_name, MAX(scan_timestamp) as max_timestamp
+                            FROM scan_results 
+                            WHERE module_name=?
+                            GROUP BY policy_id, module_name
+                        ) s2 ON s1.policy_id = s2.policy_id 
+                            AND s1.module_name = s2.module_name 
+                            AND s1.scan_timestamp = s2.max_timestamp
+                        WHERE s1.module_name=? AND s1.status='PASS'
+                    """, (module, module))
+                    module_passed = cursor.fetchone()['passed'] or 0
                     module_compliance = int((module_passed / count * 100)) if count > 0 else 0
                     stats_text += f"{module:25} {count:3} policies, {module_compliance:3}% compliance\n"
                 
@@ -2013,6 +2142,83 @@ Database: {DB_FILE}
 Created: {datetime.datetime.now().strftime('%Y-%m-%d')}
         """
         messagebox.showinfo("About", about_text)
+
+    def cleanup_duplicates(self):
+        """Clean up duplicate records in the database"""
+        if not self.conn:
+            messagebox.showerror("Error", "Database not connected")
+            return
+        
+        response = messagebox.askyesno("Clean Database", 
+            "This will remove duplicate scan results, keeping only the latest entry for each policy.\n\n"
+            "Note: This operation cannot be undone.\n\n"
+            "Do you want to proceed?")
+        
+        if not response:
+            return
+        
+        try:
+            self.show_progress("Cleaning up database duplicates...")
+            
+            cursor = self.conn.cursor()
+            
+            # Create a temporary table with unique records
+            cursor.execute('''
+                CREATE TEMPORARY TABLE temp_scan_results AS
+                SELECT 
+                    MIN(id) as id,
+                    policy_id,
+                    policy_name,
+                    expected_value,
+                    current_value,
+                    status,
+                    module_name,
+                    MAX(scan_timestamp) as scan_timestamp
+                FROM scan_results
+                GROUP BY policy_id, module_name
+            ''')
+            
+            # Count before cleanup
+            cursor.execute("SELECT COUNT(*) as count FROM scan_results")
+            before_count = cursor.fetchone()['count']
+            
+            # Delete all records
+            cursor.execute('DELETE FROM scan_results')
+            
+            # Insert unique records back
+            cursor.execute('''
+                INSERT INTO scan_results 
+                (id, policy_id, policy_name, expected_value, current_value, status, module_name, scan_timestamp)
+                SELECT id, policy_id, policy_name, expected_value, current_value, status, module_name, scan_timestamp
+                FROM temp_scan_results
+            ''')
+            
+            # Drop temporary table
+            cursor.execute('DROP TABLE temp_scan_results')
+            
+            # Count after cleanup
+            cursor.execute("SELECT COUNT(*) as count FROM scan_results")
+            after_count = cursor.fetchone()['count']
+            
+            self.conn.commit()
+            self.hide_progress()
+            
+            removed = before_count - after_count
+            messagebox.showinfo("Cleanup Complete", 
+                f"Database cleanup completed successfully!\n\n"
+                f"Records before: {before_count}\n"
+                f"Records after: {after_count}\n"
+                f"Duplicates removed: {removed}")
+            
+            # Refresh the current view
+            if self.current_module_index < len(MODULES):
+                module_name = MODULES[self.current_module_index][0]
+                self.load_scan_results(module_name)
+                self.load_fix_history()
+            
+        except Exception as e:
+            self.hide_progress()
+            messagebox.showerror("Cleanup Error", f"Failed to clean up database:\n{str(e)}")
 
 def main():
     root = tk.Tk()
