@@ -409,12 +409,6 @@ main() {
     list_rollback_items
     
     echo ""
-    read -p "Do you want to proceed with rollback? (yes/no): " confirm
-    
-    if [ "$confirm" != "yes" ] && [ "$confirm" != "y" ]; then
-        log_info "Rollback cancelled by user"
-        exit 0
-    fi
     
     echo ""
     log_info "Starting rollback process..."
